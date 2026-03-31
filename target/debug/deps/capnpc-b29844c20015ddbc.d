@@ -1,0 +1,10 @@
+/home/zahary/metacraft/codetracer-leo-recorder/target/debug/deps/capnpc-b29844c20015ddbc.d: /home/zahary/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/capnpc-0.21.4/src/lib.rs /home/zahary/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/capnpc-0.21.4/src/codegen.rs /home/zahary/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/capnpc-0.21.4/src/codegen_types.rs /home/zahary/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/capnpc-0.21.4/src/pointer_constants.rs
+
+/home/zahary/metacraft/codetracer-leo-recorder/target/debug/deps/libcapnpc-b29844c20015ddbc.rlib: /home/zahary/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/capnpc-0.21.4/src/lib.rs /home/zahary/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/capnpc-0.21.4/src/codegen.rs /home/zahary/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/capnpc-0.21.4/src/codegen_types.rs /home/zahary/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/capnpc-0.21.4/src/pointer_constants.rs
+
+/home/zahary/metacraft/codetracer-leo-recorder/target/debug/deps/libcapnpc-b29844c20015ddbc.rmeta: /home/zahary/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/capnpc-0.21.4/src/lib.rs /home/zahary/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/capnpc-0.21.4/src/codegen.rs /home/zahary/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/capnpc-0.21.4/src/codegen_types.rs /home/zahary/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/capnpc-0.21.4/src/pointer_constants.rs
+
+/home/zahary/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/capnpc-0.21.4/src/lib.rs:
+/home/zahary/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/capnpc-0.21.4/src/codegen.rs:
+/home/zahary/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/capnpc-0.21.4/src/codegen_types.rs:
+/home/zahary/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/capnpc-0.21.4/src/pointer_constants.rs:
