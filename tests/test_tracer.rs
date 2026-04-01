@@ -573,7 +573,7 @@ fn test_traced_steps_reference_leo_lines() {
     // All step lines should be within the Leo source range (1-14 for flow_test.leo).
     for &line in &step_lines {
         assert!(
-            line >= 1 && line <= 14,
+            (1..=14).contains(&line),
             "step line {} should be within Leo source range 1-14",
             line
         );
