@@ -9,9 +9,9 @@
 use std::collections::HashMap;
 
 use crate::tracer::{
-    AleoFunction, AleoInstruction, FunctionResult, MappingStore, Operand, resolve_operand,
+    resolve_operand, AleoFunction, AleoInstruction, FunctionResult, MappingStore, Operand,
 };
-use eyre::{Result, eyre};
+use eyre::{eyre, Result};
 
 // ---------------------------------------------------------------------------
 // Trace events emitted by FinalizeTracer
@@ -111,13 +111,7 @@ impl FinalizeTracer {
         // Execute each instruction with tracing.
         for (instr_idx, instr) in func.instructions.iter().enumerate() {
             // Execute the instruction.
-            self.execute_instruction(
-                instr,
-                &mut registers,
-                func,
-                func_map,
-                instr_idx,
-            )?;
+            self.execute_instruction(instr, &mut registers, func, func_map, instr_idx)?;
         }
 
         // Collect outputs.
@@ -218,12 +212,13 @@ impl FinalizeTracer {
                 args,
                 dests,
             } => {
-                let arg_values: Vec<i64> =
-                    args.iter().map(|op| resolve_operand(op, registers)).collect();
+                let arg_values: Vec<i64> = args
+                    .iter()
+                    .map(|op| resolve_operand(op, registers))
+                    .collect();
 
                 if let Some(callee) = func_map.get(function_name.as_str()) {
-                    let callee_result =
-                        self.trace_function(callee, func_map, &arg_values)?;
+                    let callee_result = self.trace_function(callee, func_map, &arg_values)?;
                     for (idx, &dest) in dests.iter().enumerate() {
                         if idx < callee_result.outputs.len() {
                             registers.insert(dest, callee_result.outputs[idx]);
@@ -307,60 +302,144 @@ impl FinalizeTracer {
 fn format_instruction(instr: &AleoInstruction) -> String {
     match instr {
         AleoInstruction::Add { src1, src2, dest } => {
-            format!("add {} {} into r{}", format_operand(src1), format_operand(src2), dest)
+            format!(
+                "add {} {} into r{}",
+                format_operand(src1),
+                format_operand(src2),
+                dest
+            )
         }
         AleoInstruction::Sub { src1, src2, dest } => {
-            format!("sub {} {} into r{}", format_operand(src1), format_operand(src2), dest)
+            format!(
+                "sub {} {} into r{}",
+                format_operand(src1),
+                format_operand(src2),
+                dest
+            )
         }
         AleoInstruction::Mul { src1, src2, dest } => {
-            format!("mul {} {} into r{}", format_operand(src1), format_operand(src2), dest)
+            format!(
+                "mul {} {} into r{}",
+                format_operand(src1),
+                format_operand(src2),
+                dest
+            )
         }
         AleoInstruction::Div { src1, src2, dest } => {
-            format!("div {} {} into r{}", format_operand(src1), format_operand(src2), dest)
+            format!(
+                "div {} {} into r{}",
+                format_operand(src1),
+                format_operand(src2),
+                dest
+            )
         }
         AleoInstruction::Mod { src1, src2, dest } => {
-            format!("mod {} {} into r{}", format_operand(src1), format_operand(src2), dest)
+            format!(
+                "mod {} {} into r{}",
+                format_operand(src1),
+                format_operand(src2),
+                dest
+            )
         }
         AleoInstruction::IsEq { src1, src2, dest } => {
-            format!("is.eq {} {} into r{}", format_operand(src1), format_operand(src2), dest)
+            format!(
+                "is.eq {} {} into r{}",
+                format_operand(src1),
+                format_operand(src2),
+                dest
+            )
         }
         AleoInstruction::IsNeq { src1, src2, dest } => {
-            format!("is.neq {} {} into r{}", format_operand(src1), format_operand(src2), dest)
+            format!(
+                "is.neq {} {} into r{}",
+                format_operand(src1),
+                format_operand(src2),
+                dest
+            )
         }
         AleoInstruction::Lt { src1, src2, dest } => {
-            format!("lt {} {} into r{}", format_operand(src1), format_operand(src2), dest)
+            format!(
+                "lt {} {} into r{}",
+                format_operand(src1),
+                format_operand(src2),
+                dest
+            )
         }
         AleoInstruction::Lte { src1, src2, dest } => {
-            format!("lte {} {} into r{}", format_operand(src1), format_operand(src2), dest)
+            format!(
+                "lte {} {} into r{}",
+                format_operand(src1),
+                format_operand(src2),
+                dest
+            )
         }
         AleoInstruction::Gt { src1, src2, dest } => {
-            format!("gt {} {} into r{}", format_operand(src1), format_operand(src2), dest)
+            format!(
+                "gt {} {} into r{}",
+                format_operand(src1),
+                format_operand(src2),
+                dest
+            )
         }
         AleoInstruction::Gte { src1, src2, dest } => {
-            format!("gte {} {} into r{}", format_operand(src1), format_operand(src2), dest)
+            format!(
+                "gte {} {} into r{}",
+                format_operand(src1),
+                format_operand(src2),
+                dest
+            )
         }
-        AleoInstruction::Call { function_name, args, dests } => {
+        AleoInstruction::Call {
+            function_name,
+            args,
+            dests,
+        } => {
             let args_str: Vec<String> = args.iter().map(format_operand).collect();
             let dests_str: Vec<String> = dests.iter().map(|d| format!("r{}", d)).collect();
             if dests_str.is_empty() {
                 format!("call {} {}", function_name, args_str.join(" "))
             } else {
-                format!("call {} {} into {}", function_name, args_str.join(" "), dests_str.join(" "))
+                format!(
+                    "call {} {} into {}",
+                    function_name,
+                    args_str.join(" "),
+                    dests_str.join(" ")
+                )
             }
         }
-        AleoInstruction::MappingGet { mapping, key_reg, value_reg } => {
+        AleoInstruction::MappingGet {
+            mapping,
+            key_reg,
+            value_reg,
+        } => {
             format!("get {}[r{}] into r{}", mapping, key_reg, value_reg)
         }
-        AleoInstruction::MappingGetOrUse { mapping, key_reg, default_reg, value_reg } => {
-            format!("get.or_use {}[r{}] r{} into r{}", mapping, key_reg, default_reg, value_reg)
+        AleoInstruction::MappingGetOrUse {
+            mapping,
+            key_reg,
+            default_reg,
+            value_reg,
+        } => {
+            format!(
+                "get.or_use {}[r{}] r{} into r{}",
+                mapping, key_reg, default_reg, value_reg
+            )
         }
-        AleoInstruction::MappingSet { mapping, key_reg, value_reg } => {
+        AleoInstruction::MappingSet {
+            mapping,
+            key_reg,
+            value_reg,
+        } => {
             format!("set r{} into {}[r{}]", value_reg, mapping, key_reg)
         }
         AleoInstruction::MappingRemove { mapping, key_reg } => {
             format!("remove {}[r{}]", mapping, key_reg)
         }
-        AleoInstruction::MappingContains { mapping, key_reg, result_reg } => {
+        AleoInstruction::MappingContains {
+            mapping,
+            key_reg,
+            result_reg,
+        } => {
             format!("contains {}[r{}] into r{}", mapping, key_reg, result_reg)
         }
         AleoInstruction::Unknown(s) => s.clone(),
@@ -723,7 +802,10 @@ finalize transfer:
         // Both are named "transfer" but one is the function (with output) and
         // one is the finalize (with mapping instructions).
         // Since both have name "transfer", find the one with 3 instructions.
-        let finalize = functions.iter().find(|f| f.instructions.len() == 3).unwrap();
+        let finalize = functions
+            .iter()
+            .find(|f| f.instructions.len() == 3)
+            .unwrap();
         assert_eq!(finalize.instructions.len(), 3);
     }
 }

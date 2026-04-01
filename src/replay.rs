@@ -16,12 +16,12 @@ use std::path::Path;
 
 use codetracer_trace_types::{Line, TypeKind, ValueRecord, NONE_VALUE};
 use codetracer_trace_writer::trace_writer::TraceWriter;
-use codetracer_trace_writer::{TraceEventsFileFormat, create_trace_writer};
-use eyre::{Context, Result, eyre};
+use codetracer_trace_writer::{create_trace_writer, TraceEventsFileFormat};
+use eyre::{eyre, Context, Result};
 
 use crate::tracer::{
-    AleoFunction, AleoInstruction, FunctionResult, MappingStore, Operand, parse_aleo_program,
-    resolve_operand,
+    parse_aleo_program, resolve_operand, AleoFunction, AleoInstruction, FunctionResult,
+    MappingStore, Operand,
 };
 
 // ---------------------------------------------------------------------------
@@ -108,8 +108,8 @@ pub fn fetch_program(client: &AleoRpcClient, program_id: &str) -> Result<Deploye
         ));
     }
 
-    let source = String::from_utf8(output.stdout)
-        .with_context(|| "program source is not valid UTF-8")?;
+    let source =
+        String::from_utf8(output.stdout).with_context(|| "program source is not valid UTF-8")?;
 
     if source.trim().is_empty() {
         return Err(eyre!("empty response for program {program_id} from {url}"));
@@ -263,10 +263,8 @@ pub fn replay_deployed_program(
     );
 
     // Find the target function.
-    let func_map: HashMap<&str, &AleoFunction> = functions
-        .iter()
-        .map(|f| (f.name.as_str(), f))
-        .collect();
+    let func_map: HashMap<&str, &AleoFunction> =
+        functions.iter().map(|f| (f.name.as_str(), f)).collect();
 
     if !func_map.contains_key(config.function_name.as_str()) {
         let available: Vec<&str> = func_map.keys().copied().collect();
@@ -325,8 +323,7 @@ pub fn replay_deployed_program(
         .map_err(|e| eyre!("{e}"))?;
     TraceWriter::begin_writing_trace_metadata(&mut *writer, &metadata_path)
         .map_err(|e| eyre!("{e}"))?;
-    TraceWriter::begin_writing_trace_paths(&mut *writer, &paths_path)
-        .map_err(|e| eyre!("{e}"))?;
+    TraceWriter::begin_writing_trace_paths(&mut *writer, &paths_path).map_err(|e| eyre!("{e}"))?;
 
     TraceWriter::start(&mut *writer, &source_path, Line(1));
 
@@ -379,11 +376,7 @@ pub fn replay_deployed_program(
             let value = result.registers[&reg_idx];
 
             // Step to the instruction line.
-            TraceWriter::register_step(
-                &mut *writer,
-                &source_path,
-                Line(instr_line),
-            );
+            TraceWriter::register_step(&mut *writer, &source_path, Line(instr_line));
 
             // Emit the register value.
             let var_name = format!("r{}", reg_idx);
@@ -391,11 +384,7 @@ pub fn replay_deployed_program(
                 i: value,
                 type_id: u32_type_id,
             };
-            TraceWriter::register_variable_with_full_value(
-                &mut *writer,
-                &var_name,
-                value_record,
-            );
+            TraceWriter::register_variable_with_full_value(&mut *writer, &var_name, value_record);
 
             instr_line += 1;
         }
@@ -504,8 +493,10 @@ fn execute_function_for_replay(
                 args,
                 dests,
             } => {
-                let arg_values: Vec<i64> =
-                    args.iter().map(|op| resolve_operand(op, &registers)).collect();
+                let arg_values: Vec<i64> = args
+                    .iter()
+                    .map(|op| resolve_operand(op, &registers))
+                    .collect();
 
                 if let Some(callee) = func_map.get(function_name.as_str()) {
                     let callee_result = execute_function_for_replay(
@@ -586,10 +577,7 @@ fn execute_function_for_replay(
         .map(|&reg| registers.get(&reg).copied().unwrap_or(0))
         .collect();
 
-    let result = FunctionResult {
-        registers,
-        outputs,
-    };
+    let result = FunctionResult { registers, outputs };
 
     results.insert(func.name.clone(), result.clone());
 
@@ -731,8 +719,12 @@ mod tests {
         };
 
         let out_dir = tempfile::tempdir().unwrap();
-        let result =
-            replay_deployed_program(&deployed, &config, out_dir.path(), TraceEventsFileFormat::Json);
+        let result = replay_deployed_program(
+            &deployed,
+            &config,
+            out_dir.path(),
+            TraceEventsFileFormat::Json,
+        );
 
         assert!(result.is_ok(), "replay failed: {:?}", result.err());
 
@@ -760,8 +752,12 @@ mod tests {
         };
 
         let out_dir = tempfile::tempdir().unwrap();
-        let result =
-            replay_deployed_program(&deployed, &config, out_dir.path(), TraceEventsFileFormat::Json);
+        let result = replay_deployed_program(
+            &deployed,
+            &config,
+            out_dir.path(),
+            TraceEventsFileFormat::Json,
+        );
 
         assert!(result.is_ok(), "replay failed: {:?}", result.err());
 
@@ -786,8 +782,12 @@ mod tests {
         };
 
         let out_dir = tempfile::tempdir().unwrap();
-        let result =
-            replay_deployed_program(&deployed, &config, out_dir.path(), TraceEventsFileFormat::Json);
+        let result = replay_deployed_program(
+            &deployed,
+            &config,
+            out_dir.path(),
+            TraceEventsFileFormat::Json,
+        );
 
         assert!(result.is_err());
         let err_msg = format!("{:?}", result.err().unwrap());
@@ -800,10 +800,8 @@ mod tests {
         // when replaying the hello.aleo mock program (3 + 5 = 8).
         let source = MOCK_HELLO_PROGRAM;
         let functions = parse_aleo_program(source);
-        let func_map: HashMap<&str, &AleoFunction> = functions
-            .iter()
-            .map(|f| (f.name.as_str(), f))
-            .collect();
+        let func_map: HashMap<&str, &AleoFunction> =
+            functions.iter().map(|f| (f.name.as_str(), f)).collect();
 
         let mut results = HashMap::new();
         let mut mapping_store = MappingStore::new();
@@ -834,10 +832,8 @@ mod tests {
         //   output r4
         let source = MOCK_ARITHMETIC_PROGRAM;
         let functions = parse_aleo_program(source);
-        let func_map: HashMap<&str, &AleoFunction> = functions
-            .iter()
-            .map(|f| (f.name.as_str(), f))
-            .collect();
+        let func_map: HashMap<&str, &AleoFunction> =
+            functions.iter().map(|f| (f.name.as_str(), f)).collect();
 
         let mut results = HashMap::new();
         let mut mapping_store = MappingStore::new();

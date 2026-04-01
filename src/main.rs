@@ -113,10 +113,7 @@ fn main() -> Result<()> {
         Commands::Record(args) => record(args),
         Commands::Replay(args) => replay(args),
         Commands::Version => {
-            println!(
-                "codetracer-leo-recorder {}",
-                env!("CARGO_PKG_VERSION")
-            );
+            println!("codetracer-leo-recorder {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
     }
