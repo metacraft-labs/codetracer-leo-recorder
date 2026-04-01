@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+use codetracer_leo_recorder::source_map::generate_source_map;
 use codetracer_trace_writer::TraceEventsFileFormat;
 
 /// Helper: path to the test-programs directory.
@@ -487,5 +488,186 @@ fn test_leo_cli_record() {
         all_values.contains(&94),
         "CLI trace should contain value 94, got values: {:?}",
         all_values
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: AleoSourceMap generation for flow_test program
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_source_map_flow_test_program() {
+    // Leo source for flow_test.
+    let leo_source = r#"program flow_test.aleo {
+    transition compute() -> u32 {
+        let a: u32 = 10u32;
+        let b: u32 = 32u32;
+        let sum_val: u32 = a + b;
+        let doubled: u32 = sum_val * 2u32;
+        let final_result: u32 = doubled + a;
+        return final_result;
+    }
+
+    transition main() -> u32 {
+        return compute();
+    }
+}"#;
+
+    // Corresponding Aleo output (as the Leo compiler would produce).
+    let aleo_source = r#"program flow_test.aleo;
+
+closure compute:
+    add 10u32 0u32 into r0;
+    add 32u32 0u32 into r1;
+    add r0 r1 into r2;
+    mul r2 2u32 into r3;
+    add r3 r0 into r4;
+    output r4 as u32;
+
+function main:
+    call compute into r0;
+    output r0 as u32.private;
+"#;
+
+    let source_map = generate_source_map(leo_source, aleo_source);
+
+    // All 5 instructions in compute should map to Leo lines 3-7.
+    assert_eq!(source_map.instruction_count("compute"), 5);
+
+    let expected_lines = [3u32, 4, 5, 6, 7];
+    for (idx, &expected_line) in expected_lines.iter().enumerate() {
+        let (file, line) = source_map
+            .resolve("compute", idx)
+            .unwrap_or_else(|| panic!("instruction {} should resolve", idx));
+        assert_eq!(
+            file, "flow_test.leo",
+            "instruction {} should map to flow_test.leo",
+            idx
+        );
+        assert_eq!(
+            line, expected_line,
+            "instruction {} should map to Leo line {}, got {}",
+            idx, expected_line, line
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: Traced steps reference Leo source lines (not Aleo lines)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_traced_steps_reference_leo_lines() {
+    let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let out_dir = tmp_dir.path().join("traces");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let source_path = test_programs_dir().join("flow_test.leo");
+    run_tracer_on_file(&source_path, &out_dir);
+
+    let events = load_trace_events(&out_dir);
+
+    // Collect step lines.
+    let step_lines: Vec<i64> = events
+        .iter()
+        .filter_map(|e| {
+            e.get("Step")
+                .and_then(|s| s.get("line"))
+                .and_then(|l| l.as_i64())
+        })
+        .collect();
+
+    // All step lines should be within the Leo source range (1-14 for flow_test.leo).
+    for &line in &step_lines {
+        assert!(
+            line >= 1 && line <= 14,
+            "step line {} should be within Leo source range 1-14",
+            line
+        );
+    }
+
+    // Specifically, the let-binding lines (3, 4, 5, 6, 7) should be present.
+    // These are Leo source lines, not Aleo instruction indices.
+    for expected in &[3i64, 4, 5, 6, 7] {
+        assert!(
+            step_lines.contains(expected),
+            "step events should include Leo source line {}, got lines: {:?}",
+            expected,
+            step_lines
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: Source map edge case — empty function (no let-bindings)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_source_map_empty_function() {
+    let leo_source = r#"program empty_test.aleo {
+    transition main() -> u32 {
+        return 0u32;
+    }
+}"#;
+
+    let aleo_source = r#"program empty_test.aleo;
+
+function main:
+    output 0u32 as u32.private;
+"#;
+
+    let source_map = generate_source_map(leo_source, aleo_source);
+
+    // main has no instructions (only output line), so instruction_count is 0.
+    assert_eq!(source_map.instruction_count("main"), 0);
+    // Resolving any index should return None.
+    assert!(
+        source_map.resolve("main", 0).is_none(),
+        "empty function should have no source map entries"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: Source map edge case — function with no let-bindings but with
+//          instructions (e.g. a wrapper that just calls another function)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_source_map_call_only_function() {
+    let leo_source = r#"program call_only.aleo {
+    transition compute() -> u32 {
+        let x: u32 = 42u32;
+        return x;
+    }
+
+    transition main() -> u32 {
+        return compute();
+    }
+}"#;
+
+    let aleo_source = r#"program call_only.aleo;
+
+closure compute:
+    add 42u32 0u32 into r0;
+    output r0 as u32;
+
+function main:
+    call compute into r0;
+    output r0 as u32.private;
+"#;
+
+    let source_map = generate_source_map(leo_source, aleo_source);
+
+    // compute has 1 instruction mapping to line 3 (let x: u32 = 42u32;).
+    assert_eq!(source_map.instruction_count("compute"), 1);
+    let (file, line) = source_map.resolve("compute", 0).unwrap();
+    assert_eq!(file, "call_only.leo");
+    assert_eq!(line, 3);
+
+    // main has 1 instruction (call) but no let-bindings, so no mapping.
+    assert_eq!(source_map.instruction_count("main"), 1);
+    assert!(
+        source_map.resolve("main", 0).is_none(),
+        "main has no let-bindings so call instruction should not map"
     );
 }
