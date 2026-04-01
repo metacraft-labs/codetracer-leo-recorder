@@ -747,10 +747,10 @@ fn find_callee_in_source(source_code: &str, func: &LeoFunctionDef) -> Option<Str
         let line_idx = (return_line as usize).checked_sub(1)?;
         if line_idx < lines.len() {
             let trimmed = lines[line_idx].trim();
-            if trimmed.starts_with("return ") {
-                let expr = trimmed[7..].trim().trim_end_matches(';').trim();
-                if expr.ends_with("()") {
-                    let name = expr[..expr.len() - 2].trim();
+            if let Some(stripped) = trimmed.strip_prefix("return ") {
+                let expr = stripped.trim().trim_end_matches(';').trim();
+                if let Some(name) = expr.strip_suffix("()") {
+                    let name = name.trim();
                     if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
                         return Some(name.to_string());
                     }
@@ -856,8 +856,7 @@ fn find_top_level_operator(expr: &str, op: char) -> Option<usize> {
 fn extract_program_name(source: &str) -> Option<String> {
     for line in source.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("program ") {
-            let after = &trimmed[8..];
+        if let Some(after) = trimmed.strip_prefix("program ") {
             if let Some(dot_pos) = after.find('.') {
                 let name = after[..dot_pos].trim();
                 if !name.is_empty() {
@@ -883,14 +882,14 @@ pub fn parse_aleo_program(source: &str) -> Vec<AleoFunction> {
         let trimmed = lines[i].trim();
 
         // Parse closure, function, or finalize definition.
-        let (is_closure, name) = if trimmed.starts_with("closure ") {
-            let name = trimmed[8..].trim_end_matches(':').trim().to_string();
+        let (is_closure, name) = if let Some(stripped) = trimmed.strip_prefix("closure ") {
+            let name = stripped.trim_end_matches(':').trim().to_string();
             (true, name)
-        } else if trimmed.starts_with("function ") {
-            let name = trimmed[9..].trim_end_matches(':').trim().to_string();
-            (false, name)
-        } else if trimmed.starts_with("finalize ") {
-            let name = trimmed[9..].trim_end_matches(':').trim().to_string();
+        } else if let Some(stripped) = trimmed
+            .strip_prefix("function ")
+            .or_else(|| trimmed.strip_prefix("finalize "))
+        {
+            let name = stripped.trim_end_matches(':').trim().to_string();
             (false, name)
         } else {
             i += 1;
@@ -961,8 +960,8 @@ pub fn parse_aleo_program(source: &str) -> Vec<AleoFunction> {
 /// Parse a register reference like `r0`, `r1`, etc. Returns the index.
 fn parse_register_ref(s: &str) -> Option<usize> {
     let s = s.trim().trim_end_matches(';');
-    if s.starts_with('r') {
-        s[1..].parse::<usize>().ok()
+    if let Some(stripped) = s.strip_prefix('r') {
+        stripped.parse::<usize>().ok()
     } else {
         None
     }
@@ -1491,14 +1490,15 @@ fn parse_leo_functions(source: &str) -> Vec<LeoFunctionDef> {
         let line_num = (i + 1) as u32;
 
         // Check for transition or function definition.
-        let (is_transition, after_keyword) = if trimmed.starts_with("transition ") {
-            (true, &trimmed[11..])
-        } else if trimmed.starts_with("function ") {
-            (false, &trimmed[9..])
-        } else {
-            i += 1;
-            continue;
-        };
+        let (is_transition, after_keyword) =
+            if let Some(stripped) = trimmed.strip_prefix("transition ") {
+                (true, stripped)
+            } else if let Some(stripped) = trimmed.strip_prefix("function ") {
+                (false, stripped)
+            } else {
+                i += 1;
+                continue;
+            };
 
         // Parse function name.
         let name_end = after_keyword.find('(').unwrap_or(after_keyword.len());
@@ -1654,8 +1654,7 @@ fn find_return_value(
 fn parse_typed_literal(s: &str) -> Option<i64> {
     // Try each known type suffix.
     for suffix in &["u32", "u64", "u128", "i32", "i64", "i128", "field"] {
-        if s.ends_with(suffix) {
-            let num_str = &s[..s.len() - suffix.len()];
+        if let Some(num_str) = s.strip_suffix(suffix) {
             if let Ok(val) = num_str.parse::<i64>() {
                 return Some(val);
             }

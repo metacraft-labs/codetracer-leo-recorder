@@ -187,7 +187,7 @@ fn parse_input_value(input: &str) -> Result<i64> {
 
     // Strip Aleo type suffix if present (e.g. "10u32" -> "10", "-5i64" -> "-5").
     // Type suffixes match the pattern: [ui](8|16|32|64|128) or "field", "scalar", etc.
-    let numeric = if let Some(pos) = trimmed.rfind(|c: char| c == 'u' || c == 'i') {
+    let numeric = if let Some(pos) = trimmed.rfind(['u', 'i']) {
         // Check if everything after 'u'/'i' is digits (a type suffix).
         let suffix = &trimmed[pos + 1..];
         let prefix = &trimmed[..pos];
