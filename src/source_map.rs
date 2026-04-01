@@ -252,10 +252,10 @@ fn parse_leo_function_info(source: &str) -> Vec<LeoFunctionInfo> {
         let trimmed = lines[i].trim();
 
         // Check for transition or function definition.
-        let after_keyword = if trimmed.starts_with("transition ") {
-            &trimmed[11..]
-        } else if trimmed.starts_with("function ") {
-            &trimmed[9..]
+        let after_keyword = if let Some(stripped) = trimmed.strip_prefix("transition ") {
+            stripped
+        } else if let Some(stripped) = trimmed.strip_prefix("function ") {
+            stripped
         } else {
             i += 1;
             continue;
@@ -377,10 +377,10 @@ fn parse_aleo_function_info(source: &str) -> Vec<AleoFunctionInfo> {
     while i < lines.len() {
         let trimmed = lines[i].trim();
 
-        let name = if trimmed.starts_with("closure ") {
-            trimmed[8..].trim_end_matches(':').trim().to_string()
-        } else if trimmed.starts_with("function ") {
-            trimmed[9..].trim_end_matches(':').trim().to_string()
+        let name = if let Some(stripped) = trimmed.strip_prefix("closure ") {
+            stripped.trim_end_matches(':').trim().to_string()
+        } else if let Some(stripped) = trimmed.strip_prefix("function ") {
+            stripped.trim_end_matches(':').trim().to_string()
         } else {
             i += 1;
             continue;
@@ -459,7 +459,7 @@ fn is_literal_load(raw: &str) -> bool {
             || operand1[1..]
                 .chars()
                 .next()
-                .map_or(true, |c| !c.is_ascii_digit());
+                .is_none_or(|c| !c.is_ascii_digit());
         // operand2 should be a zero literal (0u32, 0u64, etc.)
         let op2_is_zero = operand2.starts_with('0')
             && !operand2.starts_with("0r")

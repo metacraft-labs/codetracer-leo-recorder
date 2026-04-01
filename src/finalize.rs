@@ -54,6 +54,12 @@ pub struct FinalizeTracer {
     mapping_store: MappingStore,
 }
 
+impl Default for FinalizeTracer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FinalizeTracer {
     /// Create a new `FinalizeTracer` with an empty mapping store.
     pub fn new() -> Self {
@@ -510,7 +516,7 @@ finalize compute:
     #[test]
     fn test_finalize_tracer_mapping_operations() {
         // Simulate a finalize block that uses mapping operations.
-        let functions = vec![AleoFunction {
+        let functions = [AleoFunction {
             name: "update_balance".to_string(),
             is_closure: false,
             inputs: vec![(0, "u32".to_string()), (1, "u32".to_string())],
@@ -564,7 +570,7 @@ finalize compute:
 
     #[test]
     fn test_finalize_tracer_get_or_use() {
-        let functions = vec![AleoFunction {
+        let functions = [AleoFunction {
             name: "safe_read".to_string(),
             is_closure: false,
             inputs: vec![(0, "u32".to_string()), (1, "u32".to_string())],
@@ -602,7 +608,7 @@ finalize compute:
 
     #[test]
     fn test_finalize_tracer_mapping_remove() {
-        let functions = vec![AleoFunction {
+        let functions = [AleoFunction {
             name: "remove_entry".to_string(),
             is_closure: false,
             inputs: vec![(0, "u32".to_string())],
@@ -642,7 +648,7 @@ finalize compute:
     fn test_finalize_tracer_step_events_per_instruction() {
         // Verify that every instruction produces exactly one Step event
         // and that Variable events follow each Step.
-        let functions = vec![AleoFunction {
+        let functions = [AleoFunction {
             name: "multi".to_string(),
             is_closure: false,
             inputs: vec![],
