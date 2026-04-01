@@ -18,10 +18,10 @@ use std::process::Command;
 
 use codetracer_trace_types::{Line, TypeKind, ValueRecord, NONE_VALUE};
 use codetracer_trace_writer::trace_writer::TraceWriter;
-use codetracer_trace_writer::{TraceEventsFileFormat, create_trace_writer};
-use eyre::{Context, Result, eyre};
+use codetracer_trace_writer::{create_trace_writer, TraceEventsFileFormat};
+use eyre::{eyre, Context, Result};
 
-use crate::source_map::{AleoSourceMap, SourceMap, generate_source_map};
+use crate::source_map::{generate_source_map, AleoSourceMap, SourceMap};
 
 // ---------------------------------------------------------------------------
 // Aleo instruction types (parsed from compiled .aleo output)
@@ -112,7 +112,6 @@ pub enum AleoInstruction {
         dests: Vec<usize>,
     },
     // -- Finalize-scope mapping instructions --
-
     /// `get mapping[key_reg] into value_reg;`
     MappingGet {
         mapping: String,
@@ -133,10 +132,7 @@ pub enum AleoInstruction {
         value_reg: usize,
     },
     /// `remove mapping[key_reg];`
-    MappingRemove {
-        mapping: String,
-        key_reg: usize,
-    },
+    MappingRemove { mapping: String, key_reg: usize },
     /// `contains mapping[key_reg] into result_reg;`
     MappingContains {
         mapping: String,
@@ -305,14 +301,14 @@ impl LeoTracer {
         // -- 4. Execute the Aleo instructions --
         let execution_results = execute_aleo_program(&aleo_functions)?;
 
-        eprintln!("Executed Aleo program, got {} function results", execution_results.len());
+        eprintln!(
+            "Executed Aleo program, got {} function results",
+            execution_results.len()
+        );
 
         // -- 5. Map Aleo register values back to Leo source variables --
-        let variable_values = map_registers_to_variables(
-            &leo_functions,
-            &aleo_functions,
-            &execution_results,
-        );
+        let variable_values =
+            map_registers_to_variables(&leo_functions, &aleo_functions, &execution_results);
 
         for (name, val) in &variable_values {
             eprintln!("  {name} = {val}");
@@ -345,24 +341,24 @@ impl LeoTracer {
 
         // Register common Leo types.
         for type_name in &["u32", "u64", "i32", "i64", "field", "bool"] {
-            let type_id = TraceWriter::ensure_type_id(
-                &mut *tracer.writer,
-                TypeKind::Int,
-                type_name,
-            );
+            let type_id =
+                TraceWriter::ensure_type_id(&mut *tracer.writer, TypeKind::Int, type_name);
             tracer.type_ids.insert(type_name.to_string(), type_id);
         }
 
         // -- 9. Emit trace events --
-        tracer.emit_trace_events(source_path, &leo_functions, &variable_values, &aleo_source_map)?;
+        tracer.emit_trace_events(
+            source_path,
+            &leo_functions,
+            &variable_values,
+            &aleo_source_map,
+        )?;
 
         // -- 10. Finish writing --
-        TraceWriter::finish_writing_trace_events(&mut *tracer.writer)
-            .map_err(|e| eyre!("{e}"))?;
+        TraceWriter::finish_writing_trace_events(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
         TraceWriter::finish_writing_trace_metadata(&mut *tracer.writer)
             .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::finish_writing_trace_paths(&mut *tracer.writer)
-            .map_err(|e| eyre!("{e}"))?;
+        TraceWriter::finish_writing_trace_paths(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
 
         Ok(())
     }
@@ -380,14 +376,18 @@ impl LeoTracer {
         aleo_source_map: &AleoSourceMap,
     ) -> Result<()> {
         // Find main function and the functions it calls.
-        let func_map: HashMap<&str, &LeoFunctionDef> = leo_functions
-            .iter()
-            .map(|f| (f.name.as_str(), f))
-            .collect();
+        let func_map: HashMap<&str, &LeoFunctionDef> =
+            leo_functions.iter().map(|f| (f.name.as_str(), f)).collect();
 
         // Execute starting from main.
         if let Some(main_fn) = func_map.get("main") {
-            self.emit_function_trace(source_path, main_fn, &func_map, variable_values, aleo_source_map)?;
+            self.emit_function_trace(
+                source_path,
+                main_fn,
+                &func_map,
+                variable_values,
+                aleo_source_map,
+            )?;
         }
 
         Ok(())
@@ -435,24 +435,17 @@ impl LeoTracer {
                     .unwrap_or(binding.line);
 
                 // Emit Step event pointing to the Leo source line.
-                TraceWriter::register_step(
-                    &mut *self.writer,
-                    source_path,
-                    Line(step_line as i64),
-                );
+                TraceWriter::register_step(&mut *self.writer, source_path, Line(step_line as i64));
 
                 // Emit Value event if we have a value for this variable.
                 if let Some(&val) = variable_values.get(&binding.name) {
-                    let type_id = self.type_ids.get(&binding.type_name)
+                    let type_id = self
+                        .type_ids
+                        .get(&binding.type_name)
                         .copied()
-                        .unwrap_or_else(|| {
-                            self.type_ids.get("u32").copied().unwrap()
-                        });
+                        .unwrap_or_else(|| self.type_ids.get("u32").copied().unwrap());
 
-                    let value = ValueRecord::Int {
-                        i: val,
-                        type_id,
-                    };
+                    let value = ValueRecord::Int { i: val, type_id };
                     TraceWriter::register_variable_with_full_value(
                         &mut *self.writer,
                         &binding.name,
@@ -467,11 +460,7 @@ impl LeoTracer {
 
         // Emit return step if present.
         if let Some(return_line) = func.return_line {
-            TraceWriter::register_step(
-                &mut *self.writer,
-                source_path,
-                Line(return_line as i64),
-            );
+            TraceWriter::register_step(&mut *self.writer, source_path, Line(return_line as i64));
         }
 
         // Check if the return expression is a function call.
@@ -480,7 +469,13 @@ impl LeoTracer {
 
         if let Some(callee_name) = return_calls_function {
             if let Some(callee) = func_map.get(callee_name.as_str()) {
-                self.emit_function_trace(source_path, callee, func_map, variable_values, aleo_source_map)?;
+                self.emit_function_trace(
+                    source_path,
+                    callee,
+                    func_map,
+                    variable_values,
+                    aleo_source_map,
+                )?;
             }
         }
 
@@ -540,17 +535,16 @@ fn compile_leo_to_aleo(source_path: &Path, source_code: &str) -> Result<String> 
 fn compile_leo_to_aleo_via_cli(source_path: &Path, source_code: &str) -> Result<String> {
     let leo_bin = std::env::var("LEO_BIN").unwrap_or_else(|_| "leo".to_string());
 
-    let program_name = extract_program_name(source_code)
-        .unwrap_or_else(|| {
-            source_path
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "main".to_string())
-        });
+    let program_name = extract_program_name(source_code).unwrap_or_else(|| {
+        source_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "main".to_string())
+    });
 
     // Create a temporary Leo project directory.
-    let project_dir = tempfile::tempdir()
-        .with_context(|| "failed to create temp dir for Leo project")?;
+    let project_dir =
+        tempfile::tempdir().with_context(|| "failed to create temp dir for Leo project")?;
 
     let project_path = project_dir.path().join(&program_name);
     std::fs::create_dir_all(&project_path)
@@ -575,8 +569,7 @@ fn compile_leo_to_aleo_via_cli(source_path: &Path, source_code: &str) -> Result<
 
     // Create src/main.leo with the source code.
     let src_dir = project_path.join("src");
-    std::fs::create_dir_all(&src_dir)
-        .with_context(|| "failed to create src directory")?;
+    std::fs::create_dir_all(&src_dir).with_context(|| "failed to create src directory")?;
     std::fs::write(src_dir.join("main.leo"), source_code)
         .with_context(|| "failed to write main.leo")?;
 
@@ -587,10 +580,12 @@ fn compile_leo_to_aleo_via_cli(source_path: &Path, source_code: &str) -> Result<
         .arg("build")
         .current_dir(&project_path)
         .output()
-        .with_context(|| format!(
-            "failed to run Leo compiler ('{leo_bin}'). \
+        .with_context(|| {
+            format!(
+                "failed to run Leo compiler ('{leo_bin}'). \
              Set LEO_BIN environment variable to the path of the leo binary."
-        ))?;
+            )
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -608,21 +603,23 @@ fn compile_leo_to_aleo_via_cli(source_path: &Path, source_code: &str) -> Result<
         .join(format!("{program_name}.aleo"));
 
     if aleo_path.exists() {
-        return std::fs::read_to_string(&aleo_path)
-            .with_context(|| format!(
+        return std::fs::read_to_string(&aleo_path).with_context(|| {
+            format!(
                 "failed to read compiled Aleo instructions: {}",
                 aleo_path.display()
-            ));
+            )
+        });
     }
 
     // Try alternative path: build/main.aleo
     let alt_aleo_path = project_path.join("build").join("main.aleo");
     if alt_aleo_path.exists() {
-        return std::fs::read_to_string(&alt_aleo_path)
-            .with_context(|| format!(
+        return std::fs::read_to_string(&alt_aleo_path).with_context(|| {
+            format!(
                 "failed to read compiled Aleo instructions: {}",
                 alt_aleo_path.display()
-            ));
+            )
+        });
     }
 
     // Search for any .aleo file in the build directory.
@@ -630,11 +627,12 @@ fn compile_leo_to_aleo_via_cli(source_path: &Path, source_code: &str) -> Result<
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().map(|e| e == "aleo").unwrap_or(false) {
-                return std::fs::read_to_string(&path)
-                    .with_context(|| format!(
+                return std::fs::read_to_string(&path).with_context(|| {
+                    format!(
                         "failed to read compiled Aleo instructions: {}",
                         path.display()
-                    ));
+                    )
+                });
             }
         }
     }
@@ -658,8 +656,7 @@ fn compile_leo_to_aleo_via_cli(source_path: &Path, source_code: &str) -> Result<
 ///
 /// For complex programs, the `leo` CLI should be used instead.
 fn generate_aleo_from_leo_source(source_code: &str) -> Result<String> {
-    let program_name = extract_program_name(source_code)
-        .unwrap_or_else(|| "main".to_string());
+    let program_name = extract_program_name(source_code).unwrap_or_else(|| "main".to_string());
 
     let leo_fns = parse_leo_functions(source_code);
     let mut aleo_output = format!("program {program_name}.aleo;\n\n");
@@ -667,9 +664,7 @@ fn generate_aleo_from_leo_source(source_code: &str) -> Result<String> {
     for func in &leo_fns {
         // Determine if this function calls other functions (becomes a function)
         // or is self-contained (becomes a closure).
-        let has_call = func.return_line.is_some()
-            && func.bindings.is_empty()
-            && leo_fns.len() > 1;
+        let has_call = func.return_line.is_some() && func.bindings.is_empty() && leo_fns.len() > 1;
 
         if has_call {
             // This function just calls another function (like `main` calling `compute`).
@@ -696,11 +691,7 @@ fn generate_aleo_from_leo_source(source_code: &str) -> Result<String> {
                 next_reg += 1;
 
                 if let Some(expr) = expr {
-                    let instr = compile_expr_to_aleo(
-                        &expr,
-                        dest_reg,
-                        &var_to_reg,
-                    );
+                    let instr = compile_expr_to_aleo(&expr, dest_reg, &var_to_reg);
                     aleo_output.push_str(&format!("    {instr}\n"));
                 }
 
@@ -935,7 +926,11 @@ pub fn parse_aleo_program(source: &str) -> Vec<AleoFunction> {
             } else if line.starts_with("output ") {
                 // `output r2 as u32.private;`
                 if let Some(reg_idx) = parse_register_ref(
-                    line.strip_prefix("output ").unwrap_or("").split_whitespace().next().unwrap_or("")
+                    line.strip_prefix("output ")
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or(""),
                 ) {
                     outputs.push(reg_idx);
                 }
@@ -1029,9 +1024,8 @@ pub fn parse_aleo_instruction(line: &str) -> Option<AleoInstruction> {
     // Binary arithmetic: `add r0 r1 into r2`
     let opcode = parts[0];
     match opcode {
-        "add" | "add.w" | "sub" | "sub.w" | "mul" | "mul.w" | "div" | "div.w" |
-        "rem" | "rem.w" | "mod" |
-        "is.eq" | "is.neq" | "lt" | "lte" | "gt" | "gte" => {
+        "add" | "add.w" | "sub" | "sub.w" | "mul" | "mul.w" | "div" | "div.w" | "rem" | "rem.w"
+        | "mod" | "is.eq" | "is.neq" | "lt" | "lte" | "gt" | "gte" => {
             if parts.len() >= 5 && parts[3] == "into" {
                 let src1 = parse_operand(parts[1])?;
                 let src2 = parse_operand(parts[2])?;
@@ -1100,21 +1094,11 @@ pub fn parse_aleo_instruction(line: &str) -> Option<AleoInstruction> {
         //   set rV into mapping[rK];
         //   remove mapping[rK];
         //   contains mapping[rK] into rR;
-        "get" => {
-            parse_mapping_get(parts)
-        }
-        "get.or_use" => {
-            parse_mapping_get_or_use(parts)
-        }
-        "set" => {
-            parse_mapping_set(parts)
-        }
-        "remove" => {
-            parse_mapping_remove(parts)
-        }
-        "contains" => {
-            parse_mapping_contains(parts)
-        }
+        "get" => parse_mapping_get(parts),
+        "get.or_use" => parse_mapping_get_or_use(parts),
+        "set" => parse_mapping_set(parts),
+        "remove" => parse_mapping_remove(parts),
+        "contains" => parse_mapping_contains(parts),
         _ => Some(AleoInstruction::Unknown(line.to_string())),
     }
 }
@@ -1225,10 +1209,8 @@ pub struct FunctionResult {
 
 /// Execute all functions in the Aleo program, starting from `main`.
 fn execute_aleo_program(functions: &[AleoFunction]) -> Result<HashMap<String, FunctionResult>> {
-    let func_map: HashMap<&str, &AleoFunction> = functions
-        .iter()
-        .map(|f| (f.name.as_str(), f))
-        .collect();
+    let func_map: HashMap<&str, &AleoFunction> =
+        functions.iter().map(|f| (f.name.as_str(), f)).collect();
 
     let mut results: HashMap<String, FunctionResult> = HashMap::new();
     let mut mapping_store = MappingStore::new();
@@ -1326,7 +1308,11 @@ fn execute_function(
                 let v2 = resolve_operand(src2, &registers);
                 registers.insert(*dest, if v1 >= v2 { 1 } else { 0 });
             }
-            AleoInstruction::Call { function_name, args, dests } => {
+            AleoInstruction::Call {
+                function_name,
+                args,
+                dests,
+            } => {
                 // Resolve arguments.
                 let arg_values: Vec<i64> = args
                     .iter()
@@ -1335,13 +1321,8 @@ fn execute_function(
 
                 // Look up and execute the callee.
                 if let Some(callee) = func_map.get(function_name.as_str()) {
-                    let callee_result = execute_function(
-                        callee,
-                        func_map,
-                        &arg_values,
-                        results,
-                        mapping_store,
-                    )?;
+                    let callee_result =
+                        execute_function(callee, func_map, &arg_values, results, mapping_store)?;
 
                     // Map callee outputs to destination registers.
                     for (idx, &dest) in dests.iter().enumerate() {
@@ -1383,10 +1364,7 @@ fn execute_function(
                 let key_str = key.to_string();
                 mapping_store.set(mapping, &key_str, value);
             }
-            AleoInstruction::MappingRemove {
-                mapping,
-                key_reg,
-            } => {
+            AleoInstruction::MappingRemove { mapping, key_reg } => {
                 let key = resolve_operand(&Operand::Register(*key_reg), &registers);
                 let key_str = key.to_string();
                 mapping_store.remove(mapping, &key_str);
@@ -1412,7 +1390,8 @@ fn execute_function(
     }
 
     // Collect output values.
-    let outputs: Vec<i64> = func.outputs
+    let outputs: Vec<i64> = func
+        .outputs
         .iter()
         .map(|&reg| registers.get(&reg).copied().unwrap_or(0))
         .collect();
@@ -1800,7 +1779,11 @@ function main:
         let instr = parse_aleo_instruction("call compute into r0;");
         assert!(instr.is_some());
         match instr.unwrap() {
-            AleoInstruction::Call { function_name, dests, .. } => {
+            AleoInstruction::Call {
+                function_name,
+                dests,
+                ..
+            } => {
                 assert_eq!(function_name, "compute");
                 assert_eq!(dests, vec![0]);
             }
@@ -1896,13 +1879,11 @@ function main:
                 name: "main".to_string(),
                 is_closure: false,
                 inputs: vec![],
-                instructions: vec![
-                    AleoInstruction::Call {
-                        function_name: "compute".to_string(),
-                        args: vec![],
-                        dests: vec![0],
-                    },
-                ],
+                instructions: vec![AleoInstruction::Call {
+                    function_name: "compute".to_string(),
+                    args: vec![],
+                    dests: vec![0],
+                }],
                 outputs: vec![0],
             },
         ];
@@ -1910,11 +1891,11 @@ function main:
         let results = execute_aleo_program(&functions).unwrap();
         let compute = results.get("compute").unwrap();
 
-        assert_eq!(compute.registers[&0], 10);  // a
-        assert_eq!(compute.registers[&1], 32);  // b
-        assert_eq!(compute.registers[&2], 42);  // sum_val = a + b
-        assert_eq!(compute.registers[&3], 84);  // doubled = sum_val * 2
-        assert_eq!(compute.registers[&4], 94);  // final_result = doubled + a
+        assert_eq!(compute.registers[&0], 10); // a
+        assert_eq!(compute.registers[&1], 32); // b
+        assert_eq!(compute.registers[&2], 42); // sum_val = a + b
+        assert_eq!(compute.registers[&3], 84); // doubled = sum_val * 2
+        assert_eq!(compute.registers[&4], 94); // final_result = doubled + a
         assert_eq!(compute.outputs, vec![94]);
 
         // Main should also have the final result.
@@ -1924,43 +1905,62 @@ function main:
 
     #[test]
     fn test_map_registers_to_variables() {
-        let leo_functions = vec![
-            LeoFunctionDef {
-                name: "compute".to_string(),
-                is_transition: true,
-                line: 2,
-                bindings: vec![
-                    LeoBinding { name: "a".to_string(), type_name: "u32".to_string(), line: 3 },
-                    LeoBinding { name: "b".to_string(), type_name: "u32".to_string(), line: 4 },
-                    LeoBinding { name: "sum_val".to_string(), type_name: "u32".to_string(), line: 5 },
-                    LeoBinding { name: "doubled".to_string(), type_name: "u32".to_string(), line: 6 },
-                    LeoBinding { name: "final_result".to_string(), type_name: "u32".to_string(), line: 7 },
-                ],
-                return_line: Some(8),
-            },
-        ];
+        let leo_functions = vec![LeoFunctionDef {
+            name: "compute".to_string(),
+            is_transition: true,
+            line: 2,
+            bindings: vec![
+                LeoBinding {
+                    name: "a".to_string(),
+                    type_name: "u32".to_string(),
+                    line: 3,
+                },
+                LeoBinding {
+                    name: "b".to_string(),
+                    type_name: "u32".to_string(),
+                    line: 4,
+                },
+                LeoBinding {
+                    name: "sum_val".to_string(),
+                    type_name: "u32".to_string(),
+                    line: 5,
+                },
+                LeoBinding {
+                    name: "doubled".to_string(),
+                    type_name: "u32".to_string(),
+                    line: 6,
+                },
+                LeoBinding {
+                    name: "final_result".to_string(),
+                    type_name: "u32".to_string(),
+                    line: 7,
+                },
+            ],
+            return_line: Some(8),
+        }];
 
-        let aleo_functions = vec![
-            AleoFunction {
-                name: "compute".to_string(),
-                is_closure: true,
-                inputs: vec![], // No inputs.
-                instructions: vec![], // Not needed for mapping.
-                outputs: vec![4],
-            },
-        ];
+        let aleo_functions = vec![AleoFunction {
+            name: "compute".to_string(),
+            is_closure: true,
+            inputs: vec![],       // No inputs.
+            instructions: vec![], // Not needed for mapping.
+            outputs: vec![4],
+        }];
 
         let mut results = HashMap::new();
         let mut regs = HashMap::new();
-        regs.insert(0, 10);  // a
-        regs.insert(1, 32);  // b
-        regs.insert(2, 42);  // sum_val
-        regs.insert(3, 84);  // doubled
-        regs.insert(4, 94);  // final_result
-        results.insert("compute".to_string(), FunctionResult {
-            registers: regs,
-            outputs: vec![94],
-        });
+        regs.insert(0, 10); // a
+        regs.insert(1, 32); // b
+        regs.insert(2, 42); // sum_val
+        regs.insert(3, 84); // doubled
+        regs.insert(4, 94); // final_result
+        results.insert(
+            "compute".to_string(),
+            FunctionResult {
+                registers: regs,
+                outputs: vec![94],
+            },
+        );
 
         let vars = map_registers_to_variables(&leo_functions, &aleo_functions, &results);
 
@@ -2059,7 +2059,11 @@ function main:
     fn test_parse_mapping_get_instruction() {
         let instr = parse_aleo_instruction("get balances[r0] into r1;").unwrap();
         match instr {
-            AleoInstruction::MappingGet { mapping, key_reg, value_reg } => {
+            AleoInstruction::MappingGet {
+                mapping,
+                key_reg,
+                value_reg,
+            } => {
                 assert_eq!(mapping, "balances");
                 assert_eq!(key_reg, 0);
                 assert_eq!(value_reg, 1);
@@ -2072,7 +2076,12 @@ function main:
     fn test_parse_mapping_get_or_use_instruction() {
         let instr = parse_aleo_instruction("get.or_use balances[r0] r2 into r3;").unwrap();
         match instr {
-            AleoInstruction::MappingGetOrUse { mapping, key_reg, default_reg, value_reg } => {
+            AleoInstruction::MappingGetOrUse {
+                mapping,
+                key_reg,
+                default_reg,
+                value_reg,
+            } => {
                 assert_eq!(mapping, "balances");
                 assert_eq!(key_reg, 0);
                 assert_eq!(default_reg, 2);
@@ -2086,7 +2095,11 @@ function main:
     fn test_parse_mapping_set_instruction() {
         let instr = parse_aleo_instruction("set r1 into balances[r0];").unwrap();
         match instr {
-            AleoInstruction::MappingSet { mapping, key_reg, value_reg } => {
+            AleoInstruction::MappingSet {
+                mapping,
+                key_reg,
+                value_reg,
+            } => {
                 assert_eq!(mapping, "balances");
                 assert_eq!(key_reg, 0);
                 assert_eq!(value_reg, 1);
@@ -2111,7 +2124,11 @@ function main:
     fn test_parse_mapping_contains_instruction() {
         let instr = parse_aleo_instruction("contains balances[r0] into r1;").unwrap();
         match instr {
-            AleoInstruction::MappingContains { mapping, key_reg, result_reg } => {
+            AleoInstruction::MappingContains {
+                mapping,
+                key_reg,
+                result_reg,
+            } => {
                 assert_eq!(mapping, "balances");
                 assert_eq!(key_reg, 0);
                 assert_eq!(result_reg, 1);
@@ -2226,7 +2243,10 @@ finalize transfer:
         assert!(functions.len() >= 2);
 
         // Find the finalize block (has mapping instructions).
-        let finalize = functions.iter().find(|f| f.instructions.len() == 3).unwrap();
+        let finalize = functions
+            .iter()
+            .find(|f| f.instructions.len() == 3)
+            .unwrap();
         assert_eq!(finalize.name, "transfer");
 
         // Verify the instructions were parsed correctly.

@@ -79,10 +79,8 @@ impl TransitionContext {
     /// Create a default context with a test address for both caller and signer.
     pub fn default_test() -> Self {
         Self {
-            caller: "aleo1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq3ljyzc"
-                .to_string(),
-            signer: "aleo1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq3ljyzc"
-                .to_string(),
+            caller: "aleo1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq3ljyzc".to_string(),
+            signer: "aleo1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq3ljyzc".to_string(),
         }
     }
 }
@@ -317,12 +315,12 @@ pub fn parse_transitions(source: &str) -> Vec<TransitionInfo> {
         // Parse return type.
         let return_type = if let Some(arrow_pos) = after_keyword.find("->") {
             let after_arrow = &after_keyword[arrow_pos + 2..];
-            let ret = after_arrow
-                .trim()
-                .trim_end_matches('{')
-                .trim()
-                .to_string();
-            if ret.is_empty() { None } else { Some(ret) }
+            let ret = after_arrow.trim().trim_end_matches('{').trim().to_string();
+            if ret.is_empty() {
+                None
+            } else {
+                Some(ret)
+            }
         } else {
             None
         };
@@ -428,12 +426,11 @@ impl TransitionTracer {
     ) -> Option<String> {
         let record = self.records.get(record_name)?;
         let value = resolve_record_field(record, field_name)?;
-        self.events
-            .push(TransitionTraceEvent::RecordFieldAccess {
-                record_name: record_name.to_string(),
-                field_name: field_name.to_string(),
-                value: value.clone(),
-            });
+        self.events.push(TransitionTraceEvent::RecordFieldAccess {
+            record_name: record_name.to_string(),
+            field_name: field_name.to_string(),
+            value: value.clone(),
+        });
         Some(value)
     }
 
@@ -479,9 +476,18 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].name, "token");
         assert_eq!(records[0].fields.len(), 3);
-        assert_eq!(records[0].fields[0], ("owner".to_string(), "address".to_string()));
-        assert_eq!(records[0].fields[1], ("gates".to_string(), "u64".to_string()));
-        assert_eq!(records[0].fields[2], ("amount".to_string(), "u64".to_string()));
+        assert_eq!(
+            records[0].fields[0],
+            ("owner".to_string(), "address".to_string())
+        );
+        assert_eq!(
+            records[0].fields[1],
+            ("gates".to_string(), "u64".to_string())
+        );
+        assert_eq!(
+            records[0].fields[2],
+            ("amount".to_string(), "u64".to_string())
+        );
     }
 
     #[test]
@@ -538,8 +544,14 @@ mod tests {
         assert_eq!(transitions[0].name, "mint");
         assert!(transitions[0].is_transition);
         assert_eq!(transitions[0].params.len(), 2);
-        assert_eq!(transitions[0].params[0], ("owner".to_string(), "address".to_string()));
-        assert_eq!(transitions[0].params[1], ("amount".to_string(), "u64".to_string()));
+        assert_eq!(
+            transitions[0].params[0],
+            ("owner".to_string(), "address".to_string())
+        );
+        assert_eq!(
+            transitions[0].params[1],
+            ("amount".to_string(), "u64".to_string())
+        );
         assert_eq!(transitions[0].return_type.as_deref(), Some("token"));
 
         // Second: transition transfer
@@ -572,7 +584,10 @@ mod tests {
         assert_eq!(transitions.len(), 1);
         assert_eq!(transitions[0].name, "transfer");
         assert!(transitions[0].is_transition);
-        assert_eq!(transitions[0].params[0], ("input_record".to_string(), "token".to_string()));
+        assert_eq!(
+            transitions[0].params[0],
+            ("input_record".to_string(), "token".to_string())
+        );
     }
 
     // -- Built-in resolution tests --
@@ -644,10 +659,7 @@ mod tests {
             name: "token".to_string(),
             owner: "aleo1owner".to_string(),
             gates: 0,
-            fields: vec![
-                ("amount".to_string(), 1000),
-                ("token_id".to_string(), 42),
-            ],
+            fields: vec![("amount".to_string(), 1000), ("token_id".to_string(), 42)],
         };
         assert_eq!(
             resolve_record_field(&record, "amount"),
@@ -829,11 +841,29 @@ mod tests {
         assert_eq!(events.len(), 6); // 1 entry + 1 builtin + 2 field access + 2 output
 
         // Verify event types in order.
-        assert!(matches!(&events[0], TransitionTraceEvent::TransitionEntry { .. }));
-        assert!(matches!(&events[1], TransitionTraceEvent::BuiltinResolved { .. }));
-        assert!(matches!(&events[2], TransitionTraceEvent::RecordFieldAccess { .. }));
-        assert!(matches!(&events[3], TransitionTraceEvent::RecordFieldAccess { .. }));
-        assert!(matches!(&events[4], TransitionTraceEvent::RecordOutput { .. }));
-        assert!(matches!(&events[5], TransitionTraceEvent::RecordOutput { .. }));
+        assert!(matches!(
+            &events[0],
+            TransitionTraceEvent::TransitionEntry { .. }
+        ));
+        assert!(matches!(
+            &events[1],
+            TransitionTraceEvent::BuiltinResolved { .. }
+        ));
+        assert!(matches!(
+            &events[2],
+            TransitionTraceEvent::RecordFieldAccess { .. }
+        ));
+        assert!(matches!(
+            &events[3],
+            TransitionTraceEvent::RecordFieldAccess { .. }
+        ));
+        assert!(matches!(
+            &events[4],
+            TransitionTraceEvent::RecordOutput { .. }
+        ));
+        assert!(matches!(
+            &events[5],
+            TransitionTraceEvent::RecordOutput { .. }
+        ));
     }
 }
