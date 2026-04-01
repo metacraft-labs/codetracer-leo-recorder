@@ -21,7 +21,7 @@ use codetracer_trace_writer::trace_writer::TraceWriter;
 use codetracer_trace_writer::{TraceEventsFileFormat, create_trace_writer};
 use eyre::{Context, Result, eyre};
 
-use crate::source_map::SourceMap;
+use crate::source_map::{AleoSourceMap, SourceMap, generate_source_map};
 
 // ---------------------------------------------------------------------------
 // Aleo instruction types (parsed from compiled .aleo output)
@@ -29,7 +29,7 @@ use crate::source_map::SourceMap;
 
 /// A parsed Aleo instruction operand: either a register or a literal.
 #[derive(Debug, Clone)]
-enum Operand {
+pub enum Operand {
     /// A register reference like `r0`, `r1`, etc.
     Register(usize),
     /// A typed literal like `10u32`, `2u32`, etc.
@@ -38,7 +38,7 @@ enum Operand {
 
 /// A parsed Aleo instruction.
 #[derive(Debug, Clone)]
-enum AleoInstruction {
+pub enum AleoInstruction {
     /// `add <op1> <op2> into <dest>;`
     Add {
         src1: Operand,
@@ -111,6 +111,39 @@ enum AleoInstruction {
         args: Vec<Operand>,
         dests: Vec<usize>,
     },
+    // -- Finalize-scope mapping instructions --
+
+    /// `get mapping[key_reg] into value_reg;`
+    MappingGet {
+        mapping: String,
+        key_reg: usize,
+        value_reg: usize,
+    },
+    /// `get.or_use mapping[key_reg] default_reg into value_reg;`
+    MappingGetOrUse {
+        mapping: String,
+        key_reg: usize,
+        default_reg: usize,
+        value_reg: usize,
+    },
+    /// `set mapping[key_reg] into value_reg;`
+    MappingSet {
+        mapping: String,
+        key_reg: usize,
+        value_reg: usize,
+    },
+    /// `remove mapping[key_reg];`
+    MappingRemove {
+        mapping: String,
+        key_reg: usize,
+    },
+    /// `contains mapping[key_reg] into result_reg;`
+    MappingContains {
+        mapping: String,
+        key_reg: usize,
+        result_reg: usize,
+    },
+
     /// An instruction we don't interpret (passthrough).
     #[allow(dead_code)]
     Unknown(String),
@@ -118,18 +151,75 @@ enum AleoInstruction {
 
 /// A parsed Aleo function (closure, function, or finalize block).
 #[derive(Debug, Clone)]
-struct AleoFunction {
+pub struct AleoFunction {
     /// Function name.
-    name: String,
+    pub name: String,
     /// Whether this is a `closure` (internal) or `function` (transition).
     #[allow(dead_code)]
-    is_closure: bool,
+    pub is_closure: bool,
     /// Input registers and their types.
-    inputs: Vec<(usize, String)>,
+    pub inputs: Vec<(usize, String)>,
     /// Body instructions.
-    instructions: Vec<AleoInstruction>,
+    pub instructions: Vec<AleoInstruction>,
     /// Output registers.
-    outputs: Vec<usize>,
+    pub outputs: Vec<usize>,
+}
+
+// ---------------------------------------------------------------------------
+// Mapping store for finalize-scope simulation
+// ---------------------------------------------------------------------------
+
+/// Simulates on-chain mapping state during finalize execution.
+///
+/// Each mapping is identified by name and stores key-value pairs, where
+/// both keys and values are represented as i64 (matching the AVM interpreter's
+/// register type).
+#[derive(Debug, Clone, Default)]
+pub struct MappingStore {
+    /// mapping_name -> (key_string -> value)
+    store: HashMap<String, HashMap<String, i64>>,
+}
+
+impl MappingStore {
+    /// Create an empty mapping store.
+    pub fn new() -> Self {
+        Self {
+            store: HashMap::new(),
+        }
+    }
+
+    /// Set a value in a mapping: `mapping[key] = value`.
+    pub fn set(&mut self, mapping: &str, key: &str, value: i64) {
+        self.store
+            .entry(mapping.to_string())
+            .or_default()
+            .insert(key.to_string(), value);
+    }
+
+    /// Get a value from a mapping. Returns `None` if the key is absent.
+    pub fn get(&self, mapping: &str, key: &str) -> Option<i64> {
+        self.store.get(mapping)?.get(key).copied()
+    }
+
+    /// Get a value or return a default if the key is absent.
+    pub fn get_or_use(&self, mapping: &str, key: &str, default: i64) -> i64 {
+        self.get(mapping, key).unwrap_or(default)
+    }
+
+    /// Check whether a mapping contains a key.
+    pub fn contains(&self, mapping: &str, key: &str) -> bool {
+        self.store
+            .get(mapping)
+            .map(|m| m.contains_key(key))
+            .unwrap_or(false)
+    }
+
+    /// Remove a key from a mapping.
+    pub fn remove(&mut self, mapping: &str, key: &str) {
+        if let Some(m) = self.store.get_mut(mapping) {
+            m.remove(key);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +297,11 @@ impl LeoTracer {
 
         eprintln!("Parsed {} Aleo functions", aleo_functions.len());
 
+        // -- 3b. Generate Aleo-to-Leo source map --
+        let aleo_source_map = generate_source_map(source_code, &aleo_source);
+
+        eprintln!("Generated Aleo-to-Leo source map");
+
         // -- 4. Execute the Aleo instructions --
         let execution_results = execute_aleo_program(&aleo_functions)?;
 
@@ -259,7 +354,7 @@ impl LeoTracer {
         }
 
         // -- 9. Emit trace events --
-        tracer.emit_trace_events(source_path, &leo_functions, &variable_values)?;
+        tracer.emit_trace_events(source_path, &leo_functions, &variable_values, &aleo_source_map)?;
 
         // -- 10. Finish writing --
         TraceWriter::finish_writing_trace_events(&mut *tracer.writer)
@@ -273,11 +368,16 @@ impl LeoTracer {
     }
 
     /// Emit trace events by walking through Leo functions and their bindings.
+    ///
+    /// When an `AleoSourceMap` is available, step events point to the Leo
+    /// source lines that originated each Aleo instruction, instead of the
+    /// raw Aleo instruction positions.
     fn emit_trace_events(
         &mut self,
         source_path: &Path,
         leo_functions: &[LeoFunctionDef],
         variable_values: &HashMap<String, i64>,
+        aleo_source_map: &AleoSourceMap,
     ) -> Result<()> {
         // Find main function and the functions it calls.
         let func_map: HashMap<&str, &LeoFunctionDef> = leo_functions
@@ -287,19 +387,26 @@ impl LeoTracer {
 
         // Execute starting from main.
         if let Some(main_fn) = func_map.get("main") {
-            self.emit_function_trace(source_path, main_fn, &func_map, variable_values)?;
+            self.emit_function_trace(source_path, main_fn, &func_map, variable_values, aleo_source_map)?;
         }
 
         Ok(())
     }
 
     /// Emit trace events for a single function.
+    ///
+    /// Uses the `AleoSourceMap` to resolve step locations: if the source map
+    /// has a mapping for a given binding's position in its function, the step
+    /// event will reference the Leo source line from the source map. This
+    /// ensures traced steps always point to Leo source lines rather than
+    /// Aleo instruction positions.
     fn emit_function_trace(
         &mut self,
         source_path: &Path,
         func: &LeoFunctionDef,
         func_map: &HashMap<&str, &LeoFunctionDef>,
         variable_values: &HashMap<String, i64>,
+        aleo_source_map: &AleoSourceMap,
     ) -> Result<()> {
         // Emit Call event.
         let fn_id = TraceWriter::ensure_function_id(
@@ -311,18 +418,27 @@ impl LeoTracer {
         TraceWriter::register_call(&mut *self.writer, fn_id, vec![]);
 
         // Process bindings.
-        for binding in &func.bindings {
+        for (binding_idx, binding) in func.bindings.iter().enumerate() {
             // Check if this binding is a function call.
             // We detect this by looking for a binding whose name matches
             // a variable that holds a function call result.
             let is_call = false; // We handle calls via the call graph below.
 
             if !is_call {
-                // Emit Step event.
+                // Use the Aleo source map to resolve the Leo source line.
+                // The binding index corresponds to the Aleo instruction index
+                // within the function (since Leo let-bindings map 1:1 to
+                // Aleo instructions).
+                let step_line = aleo_source_map
+                    .resolve(&func.name, binding_idx)
+                    .map(|(_, line)| line)
+                    .unwrap_or(binding.line);
+
+                // Emit Step event pointing to the Leo source line.
                 TraceWriter::register_step(
                     &mut *self.writer,
                     source_path,
-                    Line(binding.line as i64),
+                    Line(step_line as i64),
                 );
 
                 // Emit Value event if we have a value for this variable.
@@ -364,7 +480,7 @@ impl LeoTracer {
 
         if let Some(callee_name) = return_calls_function {
             if let Some(callee) = func_map.get(callee_name.as_str()) {
-                self.emit_function_trace(source_path, callee, func_map, variable_values)?;
+                self.emit_function_trace(source_path, callee, func_map, variable_values, aleo_source_map)?;
             }
         }
 
@@ -767,7 +883,7 @@ fn extract_program_name(source: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Parse an Aleo program source into function definitions.
-fn parse_aleo_program(source: &str) -> Vec<AleoFunction> {
+pub fn parse_aleo_program(source: &str) -> Vec<AleoFunction> {
     let mut functions = Vec::new();
     let lines: Vec<&str> = source.lines().collect();
     let mut i = 0;
@@ -775,11 +891,14 @@ fn parse_aleo_program(source: &str) -> Vec<AleoFunction> {
     while i < lines.len() {
         let trimmed = lines[i].trim();
 
-        // Parse closure or function definition.
+        // Parse closure, function, or finalize definition.
         let (is_closure, name) = if trimmed.starts_with("closure ") {
             let name = trimmed[8..].trim_end_matches(':').trim().to_string();
             (true, name)
         } else if trimmed.starts_with("function ") {
+            let name = trimmed[9..].trim_end_matches(':').trim().to_string();
+            (false, name)
+        } else if trimmed.starts_with("finalize ") {
             let name = trimmed[9..].trim_end_matches(':').trim().to_string();
             (false, name)
         } else {
@@ -797,7 +916,13 @@ fn parse_aleo_program(source: &str) -> Vec<AleoFunction> {
         while i < lines.len() {
             let line = lines[i].trim();
 
-            if line.is_empty() || line.starts_with("closure ") || line.starts_with("function ") || line.starts_with("program ") {
+            if line.is_empty()
+                || line.starts_with("closure ")
+                || line.starts_with("function ")
+                || line.starts_with("finalize ")
+                || line.starts_with("program ")
+                || line.starts_with("mapping ")
+            {
                 break;
             }
 
@@ -893,7 +1018,7 @@ fn parse_operand(s: &str) -> Option<Operand> {
 }
 
 /// Parse a single Aleo instruction line.
-fn parse_aleo_instruction(line: &str) -> Option<AleoInstruction> {
+pub fn parse_aleo_instruction(line: &str) -> Option<AleoInstruction> {
     let trimmed = line.trim().trim_end_matches(';');
     let parts: Vec<&str> = trimmed.split_whitespace().collect();
 
@@ -967,8 +1092,122 @@ fn parse_aleo_instruction(line: &str) -> Option<AleoInstruction> {
                 Some(AleoInstruction::Unknown(line.to_string()))
             }
         }
+        // Mapping instructions used in finalize scopes.
+        //
+        // Aleo mapping instruction formats:
+        //   get mapping[rK] into rV;
+        //   get.or_use mapping[rK] rD into rV;
+        //   set rV into mapping[rK];
+        //   remove mapping[rK];
+        //   contains mapping[rK] into rR;
+        "get" => {
+            parse_mapping_get(parts)
+        }
+        "get.or_use" => {
+            parse_mapping_get_or_use(parts)
+        }
+        "set" => {
+            parse_mapping_set(parts)
+        }
+        "remove" => {
+            parse_mapping_remove(parts)
+        }
+        "contains" => {
+            parse_mapping_contains(parts)
+        }
         _ => Some(AleoInstruction::Unknown(line.to_string())),
     }
+}
+
+/// Parse `get mapping[rK] into rV;`
+fn parse_mapping_get(parts: Vec<&str>) -> Option<AleoInstruction> {
+    // parts: ["get", "mapping[rK]", "into", "rV"]
+    if parts.len() >= 4 && parts[2] == "into" {
+        let (mapping, key_reg) = parse_mapping_bracket(parts[1])?;
+        let value_reg = parse_register_ref(parts[3])?;
+        Some(AleoInstruction::MappingGet {
+            mapping,
+            key_reg,
+            value_reg,
+        })
+    } else {
+        None
+    }
+}
+
+/// Parse `get.or_use mapping[rK] rD into rV;`
+fn parse_mapping_get_or_use(parts: Vec<&str>) -> Option<AleoInstruction> {
+    // parts: ["get.or_use", "mapping[rK]", "rD", "into", "rV"]
+    if parts.len() >= 5 && parts[3] == "into" {
+        let (mapping, key_reg) = parse_mapping_bracket(parts[1])?;
+        let default_reg = parse_register_ref(parts[2])?;
+        let value_reg = parse_register_ref(parts[4])?;
+        Some(AleoInstruction::MappingGetOrUse {
+            mapping,
+            key_reg,
+            default_reg,
+            value_reg,
+        })
+    } else {
+        None
+    }
+}
+
+/// Parse `set rV into mapping[rK];`
+fn parse_mapping_set(parts: Vec<&str>) -> Option<AleoInstruction> {
+    // parts: ["set", "rV", "into", "mapping[rK]"]
+    if parts.len() >= 4 && parts[2] == "into" {
+        let value_reg = parse_register_ref(parts[1])?;
+        let (mapping, key_reg) = parse_mapping_bracket(parts[3])?;
+        Some(AleoInstruction::MappingSet {
+            mapping,
+            key_reg,
+            value_reg,
+        })
+    } else {
+        None
+    }
+}
+
+/// Parse `remove mapping[rK];`
+fn parse_mapping_remove(parts: Vec<&str>) -> Option<AleoInstruction> {
+    // parts: ["remove", "mapping[rK]"]
+    if parts.len() >= 2 {
+        let (mapping, key_reg) = parse_mapping_bracket(parts[1])?;
+        Some(AleoInstruction::MappingRemove { mapping, key_reg })
+    } else {
+        None
+    }
+}
+
+/// Parse `contains mapping[rK] into rR;`
+fn parse_mapping_contains(parts: Vec<&str>) -> Option<AleoInstruction> {
+    // parts: ["contains", "mapping[rK]", "into", "rR"]
+    if parts.len() >= 4 && parts[2] == "into" {
+        let (mapping, key_reg) = parse_mapping_bracket(parts[1])?;
+        let result_reg = parse_register_ref(parts[3])?;
+        Some(AleoInstruction::MappingContains {
+            mapping,
+            key_reg,
+            result_reg,
+        })
+    } else {
+        None
+    }
+}
+
+/// Parse a `mapping[rK]` token into (mapping_name, register_index).
+fn parse_mapping_bracket(token: &str) -> Option<(String, usize)> {
+    let token = token.trim().trim_end_matches(';');
+    let bracket_start = token.find('[')?;
+    let bracket_end = token.find(']')?;
+    if bracket_end <= bracket_start {
+        return None;
+    }
+    let mapping = token[..bracket_start].to_string();
+    let reg_str = &token[bracket_start + 1..bracket_end];
+    let reg = parse_register_ref(reg_str)?;
+    Some((mapping, reg))
 }
 
 // ---------------------------------------------------------------------------
@@ -977,11 +1216,11 @@ fn parse_aleo_instruction(line: &str) -> Option<AleoInstruction> {
 
 /// Result of executing an Aleo function: register values and output values.
 #[derive(Debug, Clone)]
-struct FunctionResult {
+pub struct FunctionResult {
     /// All register values after execution (register index → value).
-    registers: HashMap<usize, i64>,
+    pub registers: HashMap<usize, i64>,
     /// Output values in order.
-    outputs: Vec<i64>,
+    pub outputs: Vec<i64>,
 }
 
 /// Execute all functions in the Aleo program, starting from `main`.
@@ -992,10 +1231,11 @@ fn execute_aleo_program(functions: &[AleoFunction]) -> Result<HashMap<String, Fu
         .collect();
 
     let mut results: HashMap<String, FunctionResult> = HashMap::new();
+    let mut mapping_store = MappingStore::new();
 
     // Execute main if it exists.
     if let Some(main_fn) = func_map.get("main") {
-        execute_function(main_fn, &func_map, &[], &mut results)?;
+        execute_function(main_fn, &func_map, &[], &mut results, &mut mapping_store)?;
     }
 
     Ok(results)
@@ -1007,6 +1247,7 @@ fn execute_function(
     func_map: &HashMap<&str, &AleoFunction>,
     input_values: &[i64],
     results: &mut HashMap<String, FunctionResult>,
+    mapping_store: &mut MappingStore,
 ) -> Result<FunctionResult> {
     let mut registers: HashMap<usize, i64> = HashMap::new();
 
@@ -1099,6 +1340,7 @@ fn execute_function(
                         func_map,
                         &arg_values,
                         results,
+                        mapping_store,
                     )?;
 
                     // Map callee outputs to destination registers.
@@ -1108,6 +1350,60 @@ fn execute_function(
                         }
                     }
                 }
+            }
+            AleoInstruction::MappingGet {
+                mapping,
+                key_reg,
+                value_reg,
+            } => {
+                let key = resolve_operand(&Operand::Register(*key_reg), &registers);
+                let key_str = key.to_string();
+                let value = mapping_store.get(mapping, &key_str).unwrap_or(0);
+                registers.insert(*value_reg, value);
+            }
+            AleoInstruction::MappingGetOrUse {
+                mapping,
+                key_reg,
+                default_reg,
+                value_reg,
+            } => {
+                let key = resolve_operand(&Operand::Register(*key_reg), &registers);
+                let default = resolve_operand(&Operand::Register(*default_reg), &registers);
+                let key_str = key.to_string();
+                let value = mapping_store.get_or_use(mapping, &key_str, default);
+                registers.insert(*value_reg, value);
+            }
+            AleoInstruction::MappingSet {
+                mapping,
+                key_reg,
+                value_reg,
+            } => {
+                let key = resolve_operand(&Operand::Register(*key_reg), &registers);
+                let value = resolve_operand(&Operand::Register(*value_reg), &registers);
+                let key_str = key.to_string();
+                mapping_store.set(mapping, &key_str, value);
+            }
+            AleoInstruction::MappingRemove {
+                mapping,
+                key_reg,
+            } => {
+                let key = resolve_operand(&Operand::Register(*key_reg), &registers);
+                let key_str = key.to_string();
+                mapping_store.remove(mapping, &key_str);
+            }
+            AleoInstruction::MappingContains {
+                mapping,
+                key_reg,
+                result_reg,
+            } => {
+                let key = resolve_operand(&Operand::Register(*key_reg), &registers);
+                let key_str = key.to_string();
+                let result = if mapping_store.contains(mapping, &key_str) {
+                    1
+                } else {
+                    0
+                };
+                registers.insert(*result_reg, result);
             }
             AleoInstruction::Unknown(_) => {
                 // Skip unknown instructions.
@@ -1132,7 +1428,7 @@ fn execute_function(
 }
 
 /// Resolve an operand to its value.
-fn resolve_operand(op: &Operand, registers: &HashMap<usize, i64>) -> i64 {
+pub fn resolve_operand(op: &Operand, registers: &HashMap<usize, i64>) -> i64 {
     match op {
         Operand::Register(idx) => registers.get(idx).copied().unwrap_or(0),
         Operand::Literal(val) => *val,
@@ -1692,5 +1988,259 @@ function main:
         assert_eq!(parse_register_ref("r0;"), Some(0));
         assert_eq!(parse_register_ref("abc"), None);
         assert_eq!(parse_register_ref(""), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // MappingStore tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mapping_store_set_and_get() {
+        let mut store = MappingStore::new();
+        store.set("balances", "alice", 100);
+        assert_eq!(store.get("balances", "alice"), Some(100));
+        assert_eq!(store.get("balances", "bob"), None);
+        assert_eq!(store.get("other_mapping", "alice"), None);
+    }
+
+    #[test]
+    fn test_mapping_store_get_or_use() {
+        let mut store = MappingStore::new();
+        store.set("balances", "alice", 100);
+        assert_eq!(store.get_or_use("balances", "alice", 0), 100);
+        assert_eq!(store.get_or_use("balances", "bob", 50), 50);
+    }
+
+    #[test]
+    fn test_mapping_store_contains() {
+        let mut store = MappingStore::new();
+        assert!(!store.contains("balances", "alice"));
+        store.set("balances", "alice", 100);
+        assert!(store.contains("balances", "alice"));
+        assert!(!store.contains("balances", "bob"));
+    }
+
+    #[test]
+    fn test_mapping_store_remove() {
+        let mut store = MappingStore::new();
+        store.set("balances", "alice", 100);
+        assert!(store.contains("balances", "alice"));
+        store.remove("balances", "alice");
+        assert!(!store.contains("balances", "alice"));
+        assert_eq!(store.get("balances", "alice"), None);
+    }
+
+    #[test]
+    fn test_mapping_store_overwrite() {
+        let mut store = MappingStore::new();
+        store.set("balances", "alice", 100);
+        store.set("balances", "alice", 200);
+        assert_eq!(store.get("balances", "alice"), Some(200));
+    }
+
+    // -----------------------------------------------------------------------
+    // Mapping instruction parsing tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_mapping_bracket() {
+        let (name, reg) = parse_mapping_bracket("balances[r0]").unwrap();
+        assert_eq!(name, "balances");
+        assert_eq!(reg, 0);
+
+        let (name, reg) = parse_mapping_bracket("accounts[r5];").unwrap();
+        assert_eq!(name, "accounts");
+        assert_eq!(reg, 5);
+
+        assert!(parse_mapping_bracket("invalid").is_none());
+    }
+
+    #[test]
+    fn test_parse_mapping_get_instruction() {
+        let instr = parse_aleo_instruction("get balances[r0] into r1;").unwrap();
+        match instr {
+            AleoInstruction::MappingGet { mapping, key_reg, value_reg } => {
+                assert_eq!(mapping, "balances");
+                assert_eq!(key_reg, 0);
+                assert_eq!(value_reg, 1);
+            }
+            other => panic!("expected MappingGet, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_mapping_get_or_use_instruction() {
+        let instr = parse_aleo_instruction("get.or_use balances[r0] r2 into r3;").unwrap();
+        match instr {
+            AleoInstruction::MappingGetOrUse { mapping, key_reg, default_reg, value_reg } => {
+                assert_eq!(mapping, "balances");
+                assert_eq!(key_reg, 0);
+                assert_eq!(default_reg, 2);
+                assert_eq!(value_reg, 3);
+            }
+            other => panic!("expected MappingGetOrUse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_mapping_set_instruction() {
+        let instr = parse_aleo_instruction("set r1 into balances[r0];").unwrap();
+        match instr {
+            AleoInstruction::MappingSet { mapping, key_reg, value_reg } => {
+                assert_eq!(mapping, "balances");
+                assert_eq!(key_reg, 0);
+                assert_eq!(value_reg, 1);
+            }
+            other => panic!("expected MappingSet, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_mapping_remove_instruction() {
+        let instr = parse_aleo_instruction("remove balances[r0];").unwrap();
+        match instr {
+            AleoInstruction::MappingRemove { mapping, key_reg } => {
+                assert_eq!(mapping, "balances");
+                assert_eq!(key_reg, 0);
+            }
+            other => panic!("expected MappingRemove, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_mapping_contains_instruction() {
+        let instr = parse_aleo_instruction("contains balances[r0] into r1;").unwrap();
+        match instr {
+            AleoInstruction::MappingContains { mapping, key_reg, result_reg } => {
+                assert_eq!(mapping, "balances");
+                assert_eq!(key_reg, 0);
+                assert_eq!(result_reg, 1);
+            }
+            other => panic!("expected MappingContains, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Mapping execution tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_execute_mapping_operations() {
+        // Build a finalize-like function that exercises all mapping ops.
+        // We use execute_function directly since execute_aleo_program only starts from "main".
+        let func = AleoFunction {
+            name: "finalize_test".to_string(),
+            is_closure: false,
+            inputs: vec![(0, "u32".to_string()), (1, "u32".to_string())],
+            instructions: vec![
+                // set r1 into balances[r0]    (balances[key] = value)
+                AleoInstruction::MappingSet {
+                    mapping: "balances".to_string(),
+                    key_reg: 0,
+                    value_reg: 1,
+                },
+                // contains balances[r0] into r2
+                AleoInstruction::MappingContains {
+                    mapping: "balances".to_string(),
+                    key_reg: 0,
+                    result_reg: 2,
+                },
+                // get balances[r0] into r3
+                AleoInstruction::MappingGet {
+                    mapping: "balances".to_string(),
+                    key_reg: 0,
+                    value_reg: 3,
+                },
+                // remove balances[r0]
+                AleoInstruction::MappingRemove {
+                    mapping: "balances".to_string(),
+                    key_reg: 0,
+                },
+                // contains balances[r0] into r4  (should be 0 after remove)
+                AleoInstruction::MappingContains {
+                    mapping: "balances".to_string(),
+                    key_reg: 0,
+                    result_reg: 4,
+                },
+                // get.or_use balances[r0] r1 into r5  (should use default after remove)
+                AleoInstruction::MappingGetOrUse {
+                    mapping: "balances".to_string(),
+                    key_reg: 0,
+                    default_reg: 1,
+                    value_reg: 5,
+                },
+            ],
+            outputs: vec![2, 3, 4, 5],
+        };
+
+        let func_map: HashMap<&str, &AleoFunction> =
+            [("finalize_test", &func)].into_iter().collect();
+        let mut results = HashMap::new();
+        let mut mapping_store = MappingStore::new();
+
+        // Input: r0=42 (key), r1=100 (value)
+        let result = execute_function(
+            &func,
+            &func_map,
+            &[42, 100],
+            &mut results,
+            &mut mapping_store,
+        )
+        .unwrap();
+
+        // After set: balances["42"] = 100
+        // contains -> r2 = 1
+        assert_eq!(result.registers[&2], 1);
+        // get -> r3 = 100
+        assert_eq!(result.registers[&3], 100);
+        // After remove: balances["42"] gone
+        // contains -> r4 = 0
+        assert_eq!(result.registers[&4], 0);
+        // get.or_use with default r1=100 -> r5 = 100
+        assert_eq!(result.registers[&5], 100);
+    }
+
+    #[test]
+    fn test_parse_finalize_block() {
+        let aleo_source = r#"program token.aleo;
+
+mapping balances:
+    key as address.public;
+    value as u64.public;
+
+function transfer:
+    input r0 as address.private;
+    input r1 as u64.private;
+    output r0 as address.private;
+
+finalize transfer:
+    input r0 as address.public;
+    input r1 as u64.public;
+    get.or_use balances[r0] r1 into r2;
+    add r2 r1 into r3;
+    set r3 into balances[r0];
+"#;
+        let functions = parse_aleo_program(aleo_source);
+
+        // Should parse the function and finalize blocks.
+        assert!(functions.len() >= 2);
+
+        // Find the finalize block (has mapping instructions).
+        let finalize = functions.iter().find(|f| f.instructions.len() == 3).unwrap();
+        assert_eq!(finalize.name, "transfer");
+
+        // Verify the instructions were parsed correctly.
+        assert!(matches!(
+            finalize.instructions[0],
+            AleoInstruction::MappingGetOrUse { .. }
+        ));
+        assert!(matches!(
+            finalize.instructions[1],
+            AleoInstruction::Add { .. }
+        ));
+        assert!(matches!(
+            finalize.instructions[2],
+            AleoInstruction::MappingSet { .. }
+        ));
     }
 }

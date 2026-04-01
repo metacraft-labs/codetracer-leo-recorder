@@ -43,6 +43,13 @@ enum Commands {
     /// to `--out-dir`.
     Record(RecordArgs),
 
+    /// Replay a deployed Aleo program fetched from the network.
+    ///
+    /// Fetches the program's Aleo Instructions source via the Aleo node
+    /// REST API, executes the specified function through the AVM interpreter,
+    /// and writes CodeTracer trace files to `--out-dir`.
+    Replay(ReplayArgs),
+
     /// Print version information.
     Version,
 }
@@ -69,6 +76,33 @@ struct RecordArgs {
     format: OutputFormat,
 }
 
+#[derive(Debug, clap::Args)]
+struct ReplayArgs {
+    /// The on-chain program ID (e.g. `credits.aleo`).
+    #[arg(long)]
+    program_id: String,
+
+    /// The function to execute within the program.
+    #[arg(long)]
+    function: String,
+
+    /// Input values for the function (repeatable, e.g. `--input 10u32 --input 20u32`).
+    #[arg(long = "input")]
+    inputs: Vec<String>,
+
+    /// Aleo node REST API endpoint.
+    #[arg(long, default_value = "https://api.explorer.aleo.org/v1")]
+    endpoint: String,
+
+    /// Directory where the trace files will be written.
+    #[arg(short = 'o', long, default_value = "./ct-traces/")]
+    out_dir: PathBuf,
+
+    /// Output format for the trace data.
+    #[arg(short = 'f', long, default_value = "binary")]
+    format: OutputFormat,
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -77,6 +111,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Record(args) => record(args),
+        Commands::Replay(args) => replay(args),
         Commands::Version => {
             println!(
                 "codetracer-leo-recorder {}",
@@ -117,4 +152,25 @@ fn record(args: RecordArgs) -> Result<()> {
     eprintln!("Trace files written to {}", out_dir.display());
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `replay` implementation
+// ---------------------------------------------------------------------------
+
+/// Execute the `replay` subcommand.
+fn replay(args: ReplayArgs) -> Result<()> {
+    let format = match args.format {
+        OutputFormat::Binary => TraceEventsFileFormat::Binary,
+        OutputFormat::Json => TraceEventsFileFormat::Json,
+    };
+
+    let config = codetracer_leo_recorder::replay::ReplayConfig {
+        program_id: args.program_id,
+        function_name: args.function,
+        inputs: args.inputs,
+        endpoint: args.endpoint,
+    };
+
+    codetracer_leo_recorder::replay::replay_program(&config, &args.out_dir, format)
 }
