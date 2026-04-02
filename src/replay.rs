@@ -315,7 +315,11 @@ pub fn replay_deployed_program(
     let program_str = source_path.to_string_lossy().to_string();
     let mut writer = create_trace_writer(&program_str, &[], format);
 
-    let events_path = out_dir.join("trace.bin");
+    let events_filename = match format {
+        TraceEventsFileFormat::Json => "trace.json",
+        TraceEventsFileFormat::Binary | TraceEventsFileFormat::BinaryV0 => "trace.bin",
+    };
+    let events_path = out_dir.join(events_filename);
     let metadata_path = out_dir.join("trace_metadata.json");
     let paths_path = out_dir.join("trace_paths.json");
 
@@ -729,7 +733,7 @@ mod tests {
         assert!(result.is_ok(), "replay failed: {:?}", result.err());
 
         // Verify trace files were written.
-        assert!(out_dir.path().join("trace.bin").exists());
+        assert!(out_dir.path().join("trace.json").exists());
         assert!(out_dir.path().join("trace_metadata.json").exists());
         assert!(out_dir.path().join("trace_paths.json").exists());
 
