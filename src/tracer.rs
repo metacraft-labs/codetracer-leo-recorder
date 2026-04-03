@@ -358,6 +358,9 @@ impl LeoTracer {
             &aleo_source_map,
         )?;
 
+        // Close the <toplevel> call that start() opened.
+        TraceWriter::register_return(&mut *tracer.writer, NONE_VALUE);
+
         // -- 10. Finish writing --
         TraceWriter::finish_writing_trace_events(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
         TraceWriter::finish_writing_trace_metadata(&mut *tracer.writer)
@@ -383,7 +386,9 @@ impl LeoTracer {
         let func_map: HashMap<&str, &LeoFunctionDef> =
             leo_functions.iter().map(|f| (f.name.as_str(), f)).collect();
 
-        // Execute starting from main.
+        // Execute starting from main. Merge main into <toplevel> by passing
+        // is_entry_point=true so its Call/Return events are suppressed and all
+        // steps remain at depth 0.
         if let Some(main_fn) = func_map.get("main") {
             self.emit_function_trace(
                 source_path,
@@ -391,6 +396,7 @@ impl LeoTracer {
                 &func_map,
                 variable_values,
                 aleo_source_map,
+                true,
             )?;
         }
 
@@ -404,6 +410,9 @@ impl LeoTracer {
     /// event will reference the Leo source line from the source map. This
     /// ensures traced steps always point to Leo source lines rather than
     /// Aleo instruction positions.
+    ///
+    /// When `is_entry_point` is true, Call/Return events are suppressed so the
+    /// function body runs at depth 0 under `<toplevel>`.
     fn emit_function_trace(
         &mut self,
         source_path: &Path,
@@ -411,15 +420,18 @@ impl LeoTracer {
         func_map: &HashMap<&str, &LeoFunctionDef>,
         variable_values: &HashMap<String, i64>,
         aleo_source_map: &AleoSourceMap,
+        is_entry_point: bool,
     ) -> Result<()> {
-        // Emit Call event.
+        // Register function metadata (for function list / calltrace).
         let fn_id = TraceWriter::ensure_function_id(
             &mut *self.writer,
             &func.name,
             source_path,
             Line(func.line as i64),
         );
-        TraceWriter::register_call(&mut *self.writer, fn_id, vec![]);
+        if !is_entry_point {
+            TraceWriter::register_call(&mut *self.writer, fn_id, vec![]);
+        }
 
         // Process bindings.
         for (binding_idx, binding) in func.bindings.iter().enumerate() {
@@ -479,22 +491,24 @@ impl LeoTracer {
                     func_map,
                     variable_values,
                     aleo_source_map,
+                    false,
                 )?;
             }
         }
 
-        // Emit Return event.
-        // Find the return value: it's the last variable in the called function
-        // or the function itself.
-        let return_value = find_return_value(func, func_map, variable_values);
-        match return_value {
-            Some(val) => {
-                let type_id = self.type_ids.get("u32").copied().unwrap();
-                let value = ValueRecord::Int { i: val, type_id };
-                TraceWriter::register_return(&mut *self.writer, value);
-            }
-            None => {
-                TraceWriter::register_return(&mut *self.writer, NONE_VALUE);
+        // Emit Return event (skip for entry point — its steps live under
+        // <toplevel> which is closed separately).
+        if !is_entry_point {
+            let return_value = find_return_value(func, func_map, variable_values);
+            match return_value {
+                Some(val) => {
+                    let type_id = self.type_ids.get("u32").copied().unwrap();
+                    let value = ValueRecord::Int { i: val, type_id };
+                    TraceWriter::register_return(&mut *self.writer, value);
+                }
+                None => {
+                    TraceWriter::register_return(&mut *self.writer, NONE_VALUE);
+                }
             }
         }
 
