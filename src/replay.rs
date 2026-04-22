@@ -400,6 +400,7 @@ pub fn replay_deployed_program(
     TraceWriter::finish_writing_trace_events(&mut *writer).map_err(|e| eyre!("{e}"))?;
     TraceWriter::finish_writing_trace_metadata(&mut *writer).map_err(|e| eyre!("{e}"))?;
     TraceWriter::finish_writing_trace_paths(&mut *writer).map_err(|e| eyre!("{e}"))?;
+    writer.close().map_err(|e| eyre!("{e}"))?;
 
     eprintln!("Trace files written to {}", out_dir.display());
 
@@ -731,10 +732,17 @@ mod tests {
 
         assert!(result.is_ok(), "replay failed: {:?}", result.err());
 
-        // Verify trace files were written.
-        assert!(out_dir.path().join("trace.json").exists());
-        assert!(out_dir.path().join("trace_metadata.json").exists());
-        assert!(out_dir.path().join("trace_paths.json").exists());
+        // Verify .ct output with CTFS magic bytes.
+        let ct_files: Vec<_> = std::fs::read_dir(out_dir.path())
+            .expect("read output dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
+            .collect();
+        assert!(!ct_files.is_empty(), "expected at least one .ct file in output dir");
+        let content = std::fs::read(&ct_files[0]).expect("read .ct file");
+        assert!(content.len() >= 5, ".ct file too small");
+        assert_eq!(&content[..5], &[0xC0u8, 0xDE, 0x72, 0xAC, 0xE2], "CTFS magic bytes mismatch");
 
         // Verify the source file was written.
         assert!(out_dir.path().join("hello.aleo").exists());
