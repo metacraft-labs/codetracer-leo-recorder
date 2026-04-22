@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use codetracer_leo_recorder::source_map::generate_source_map;
-use codetracer_trace_writer::TraceEventsFileFormat;
+use codetracer_trace_writer_nim::TraceEventsFileFormat;
 
 /// Helper: path to the test-programs directory.
 fn test_programs_dir() -> PathBuf {
