@@ -701,12 +701,10 @@ fn generate_aleo_from_leo_source(source_code: &str) -> Result<String> {
 
             // Generate Aleo instructions from let-bindings.
             let mut var_to_reg: HashMap<String, usize> = HashMap::new();
-            let mut next_reg: usize = 0;
 
-            for binding in &func.bindings {
+            for (next_reg, binding) in func.bindings.iter().enumerate() {
                 let expr = find_binding_expr(source_code, binding);
                 let dest_reg = next_reg;
-                next_reg += 1;
 
                 if let Some(expr) = expr {
                     let instr = compile_expr_to_aleo(&expr, dest_reg, &var_to_reg);
@@ -718,7 +716,7 @@ fn generate_aleo_from_leo_source(source_code: &str) -> Result<String> {
 
             // Output the last register (return value).
             if !func.bindings.is_empty() {
-                let last_reg = next_reg - 1;
+                let last_reg = func.bindings.len() - 1;
                 aleo_output.push_str(&format!("    output r{last_reg} as u32;\n"));
             }
         }
