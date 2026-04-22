@@ -374,9 +374,8 @@ pub fn replay_deployed_program(
 
         // Find instruction lines within the function (lines after the function
         // declaration that contain instructions, not input/output declarations).
-        let mut instr_line = func_start_line + 1;
-
-        for &reg_idx in &reg_indices {
+        for (i, &reg_idx) in reg_indices.iter().enumerate() {
+            let instr_line = func_start_line + 1 + i as i64;
             let value = result.registers[&reg_idx];
 
             // Step to the instruction line.
@@ -389,8 +388,6 @@ pub fn replay_deployed_program(
                 type_id: u32_type_id,
             };
             TraceWriter::register_variable_with_full_value(&mut *writer, &var_name, value_record);
-
-            instr_line += 1;
         }
     }
 
