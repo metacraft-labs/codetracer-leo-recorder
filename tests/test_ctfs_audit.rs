@@ -1,0 +1,189 @@
+//! CTFS audit regression tests for the Leo recorder.
+//!
+//! Closes audit gaps documented in AUDIT-CTFS-2026-05.md:
+//!
+//! - (a) `--format ctfs` is the default; the CLI advertises it and
+//!   produces the canonical multi-stream `.ct` container by default.
+//! - (c) Transition parameter names are surfaced on `CallRecord.args`
+//!   via `TraceWriter::arg(name, NONE_VALUE)` staging so the
+//!   calltrace pane's `.call-arg` rows match the source.
+
+use std::path::{Path, PathBuf};
+
+use codetracer_trace_writer_nim::TraceEventsFileFormat;
+
+/// CTFS magic bytes: C0 DE 72 AC E2.
+///
+/// See `codetracer-trace-format-spec/` for the canonical schema.
+const CTFS_MAGIC: [u8; 5] = [0xC0, 0xDE, 0x72, 0xAC, 0xE2];
+
+fn test_programs_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-programs/leo")
+}
+
+fn first_ct_file(out_dir: &Path) -> PathBuf {
+    let ct_files: Vec<_> = std::fs::read_dir(out_dir)
+        .expect("read output dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "ct"))
+        .collect();
+    assert!(
+        !ct_files.is_empty(),
+        "expected at least one .ct file in {}",
+        out_dir.display()
+    );
+    ct_files[0].clone()
+}
+
+// ---------------------------------------------------------------------------
+// Audit (a) -- default-Ctfs CLI + canonical multi-stream `.ct` container
+// ---------------------------------------------------------------------------
+
+/// Recording with `TraceEventsFileFormat::Ctfs` produces a `.ct` container
+/// whose first 5 bytes match the canonical CTFS magic.
+#[test]
+fn ctfs_writer_produces_ct_container() {
+    let tmp_dir = tempfile::tempdir().expect("temp dir");
+    let out_dir = tmp_dir.path().join("ctfs-traces");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let source_path = test_programs_dir().join("flow_test.leo");
+    codetracer_leo_recorder::recorder::record(
+        &source_path,
+        &out_dir,
+        TraceEventsFileFormat::Ctfs,
+    )
+    .expect("record should succeed");
+
+    let ct_path = first_ct_file(&out_dir);
+    let bytes = std::fs::read(&ct_path).expect("read .ct file");
+    assert!(
+        bytes.len() > CTFS_MAGIC.len(),
+        ".ct container should have a header + body, got {} bytes",
+        bytes.len()
+    );
+    assert_eq!(
+        &bytes[..CTFS_MAGIC.len()],
+        &CTFS_MAGIC,
+        ".ct container should start with the canonical CTFS magic"
+    );
+}
+
+/// `record --help` advertises the Ctfs format and lists it as the default.
+///
+/// Same idiom as the audited recorders (Flow 1.52 / Fuel 1.53 / PolkaVM 1.55
+/// / Miden 1.56 / TON 1.57 / Circom 1.58).
+#[test]
+fn ctfs_format_advertised_in_record_help() {
+    let output = std::process::Command::new(env!("CARGO"))
+        .args(["run", "--quiet", "--", "record", "--help"])
+        .output()
+        .expect("failed to run record --help");
+
+    assert!(
+        output.status.success(),
+        "record --help should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("ctfs"),
+        "record --help should advertise the `ctfs` format value, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("[default: ctfs]"),
+        "record --help should advertise `ctfs` as the DEFAULT format, got:\n{}",
+        stdout
+    );
+}
+
+/// Invoking `record` without `--format` produces a CTFS-magic `.ct`
+/// container, proving that `ctfs` is the wired-through default.
+#[test]
+fn ctfs_is_the_default_record_format() {
+    let tmp_dir = tempfile::tempdir().expect("temp dir");
+    let out_dir = tmp_dir.path().join("default-format-traces");
+    let source_path = test_programs_dir().join("flow_test.leo");
+
+    let output = std::process::Command::new(env!("CARGO"))
+        .args([
+            "run",
+            "--quiet",
+            "--",
+            "record",
+            source_path.to_str().unwrap(),
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run record");
+
+    assert!(
+        output.status.success(),
+        "default-format record should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let ct_path = first_ct_file(&out_dir);
+    let bytes = std::fs::read(&ct_path).expect("read .ct file");
+    assert!(bytes.len() >= CTFS_MAGIC.len(), ".ct file too small");
+    assert_eq!(
+        &bytes[..CTFS_MAGIC.len()],
+        &CTFS_MAGIC,
+        "default-format .ct should be a canonical CTFS container"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Audit (c) -- transition parameter staging via TraceWriter::arg
+// ---------------------------------------------------------------------------
+
+/// Structural smoke test for the parameter-staging path: a Leo program
+/// with a parameterised transition should still produce a non-empty .ct
+/// container after the staging fix.  The reader-side end-to-end content
+/// assertion (verifying the staged names appear as CallRecord arg names
+/// in the embedded event log) is deferred to the cross-cutting follow-up
+/// tracked in AUDIT-CTFS-2026-05.md (also open for Cairo, Cardano, Flow,
+/// Fuel, PolkaVM, Miden, TON, Circom).
+#[test]
+fn call_arg_staging_does_not_empty_trace() {
+    // Author a tiny Leo program with a parameterised transition.
+    // The staging path runs for every non-entry-point function, which
+    // the recorder maps to the callees of `main`.
+    let tmp_src = tempfile::tempdir().expect("temp dir");
+    let leo_src = r#"program staging_test.aleo {
+    transition compute(a: u32, b: u32) -> u32 {
+        let sum_val: u32 = a + b;
+        return sum_val;
+    }
+
+    transition main() -> u32 {
+        return compute();
+    }
+}"#;
+    let leo_path = tmp_src.path().join("staging.leo");
+    std::fs::write(&leo_path, leo_src).expect("write leo source");
+
+    let tmp_out = tempfile::tempdir().expect("temp dir");
+    let out_dir = tmp_out.path().join("staging-traces");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    codetracer_leo_recorder::recorder::record(&leo_path, &out_dir, TraceEventsFileFormat::Ctfs)
+        .expect("record should succeed");
+
+    let ct_path = first_ct_file(&out_dir);
+    let bytes = std::fs::read(&ct_path).expect("read .ct file");
+    assert!(
+        bytes.len() > CTFS_MAGIC.len() + 16,
+        "parameterised-transition .ct container should have substantial content, got {} bytes",
+        bytes.len()
+    );
+    assert_eq!(
+        &bytes[..CTFS_MAGIC.len()],
+        &CTFS_MAGIC,
+        "staging-test .ct should be a canonical CTFS container"
+    );
+}

@@ -15,7 +15,10 @@ fn test_programs_dir() -> PathBuf {
 }
 
 fn run_tracer_on_file(source_path: &Path, out_dir: &Path) {
-    codetracer_leo_recorder::recorder::record(source_path, out_dir, TraceEventsFileFormat::Binary)
+    // Use TraceEventsFileFormat::Ctfs explicitly: the eventual Nim writer
+    // treatment of Json vs. Ctfs may diverge, and the canonical CTFS
+    // multi-stream container is the format the readers consume.
+    codetracer_leo_recorder::recorder::record(source_path, out_dir, TraceEventsFileFormat::Ctfs)
         .expect("trace_program should succeed");
 }
 
@@ -128,7 +131,7 @@ fn test_leo_cli_record() {
             "--out-dir",
             out_dir.to_str().unwrap(),
             "--format",
-            "json",
+            "ctfs",
         ])
         .output()
         .expect("failed to run");

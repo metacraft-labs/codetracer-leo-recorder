@@ -367,6 +367,36 @@ pub fn replay_deployed_program(
         &source_path,
         Line(func_start_line),
     );
+
+    // Stage Aleo input registers as call args (audit (c)).
+    //
+    // The Aleo Instructions source declares each transition's inputs via
+    // `input rN as <type>;` lines.  We surface them on `CallRecord.args`
+    // by staging each via `TraceWriter::arg` BEFORE `register_call`.
+    // The argument NAME is the register identifier (`r0`, `r1`, ...) and
+    // the VALUE is the live `input_values[i]` pushed by the caller.
+    //
+    // This mirrors the staging shape used by Miden 1.56 (operand-stack
+    // s0..s3), PolkaVM 1.55 (Ecalli A0..A5) and Circom 1.58 (declared
+    // `signal input` names).
+    let target_func = func_map[config.function_name.as_str()];
+    for (idx, (reg_idx, type_name)) in target_func.inputs.iter().enumerate() {
+        let arg_name = format!("r{}", reg_idx);
+        let arg_type_id = type_ids
+            .get(type_name)
+            .copied()
+            .unwrap_or(u32_type_id);
+        let arg_value = if idx < input_values.len() {
+            ValueRecord::Int {
+                i: input_values[idx],
+                type_id: arg_type_id,
+            }
+        } else {
+            NONE_VALUE
+        };
+        TraceWriter::arg(&mut *writer, &arg_name, arg_value);
+    }
+
     TraceWriter::register_call(&mut *writer, fn_id, vec![]);
 
     // Emit value events for registers from the target function's result.
