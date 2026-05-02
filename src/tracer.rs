@@ -243,6 +243,18 @@ struct LeoFunctionDef {
     is_transition: bool,
     /// 1-based line number of the function definition.
     line: u32,
+    /// Declared parameter names in source order (e.g. for
+    /// `transition transfer(receiver: address, amount: u64)` this is
+    /// `["receiver", "amount"]`).
+    ///
+    /// Surfaced on `CallRecord.args` via `TraceWriter::arg(name, NONE_VALUE)`
+    /// staged before `register_call` -- mirrors the Circom 1.58 declared-
+    /// input-signal staging and the TON 1.57 declared-func.params staging.
+    /// Live argument values are NOT yet threaded back to these names because
+    /// the Leo-to-Aleo register mapping at the call site requires symbolic
+    /// argument-expression resolution that the current parser does not
+    /// perform; see AUDIT-CTFS-2026-05.md follow-ups.
+    parameters: Vec<String>,
     /// Variable bindings in order.
     bindings: Vec<LeoBinding>,
     /// 1-based line number of the return statement (if any).
@@ -433,6 +445,17 @@ impl LeoTracer {
             Line(func.line as i64),
         );
         if !is_entry_point {
+            // Stage declared parameter NAMES via `TraceWriter::arg(name,
+            // NONE_VALUE)` before `register_call` (audit (c)).  Mirrors the
+            // Circom 1.58 declared-input-signal staging and the TON 1.57
+            // declared-func.params staging.  Live argument values are not
+            // yet threaded back to these names because the Leo-source
+            // parser does not currently resolve the call-site argument
+            // expressions to their evaluated register values; documented
+            // as a follow-up in AUDIT-CTFS-2026-05.md.
+            for param_name in &func.parameters {
+                TraceWriter::arg(&mut *self.writer, param_name, NONE_VALUE);
+            }
             TraceWriter::register_call(&mut *self.writer, fn_id, vec![]);
         }
 
@@ -1523,6 +1546,67 @@ fn parse_leo_functions(source: &str) -> Vec<LeoFunctionDef> {
         let name_end = after_keyword.find('(').unwrap_or(after_keyword.len());
         let name = after_keyword[..name_end].trim().to_string();
 
+        // Parse parameter list, if present, by scanning `(...)` and
+        // extracting each `<param_name>: <type>` declaration's name.
+        // Multi-line parameter lists are not supported; the Leo style
+        // guide keeps them on one line for transitions and functions.
+        let parameters = if name_end < after_keyword.len() {
+            let after_name = &after_keyword[name_end..];
+            // Find matching close paren on the same line(s).  We scan the
+            // current source line first, then continue across lines until
+            // the closing `)` is found (params can wrap onto continuation
+            // lines for long signatures).
+            let mut params_text = String::new();
+            let mut paren_depth = 0i32;
+            let mut closed = false;
+            for ch in after_name.chars() {
+                match ch {
+                    '(' => paren_depth += 1,
+                    ')' => {
+                        paren_depth -= 1;
+                        if paren_depth == 0 {
+                            closed = true;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                if paren_depth >= 1
+                    && !(ch == '(' && paren_depth == 1 && params_text.is_empty())
+                {
+                    params_text.push(ch);
+                }
+            }
+            if !closed {
+                // Continue collecting across following source lines until
+                // the matching `)` is found.  This tolerates wrapped
+                // parameter lists.
+                let mut k = i + 1;
+                while !closed && k < lines.len() {
+                    for ch in lines[k].chars() {
+                        match ch {
+                            '(' => paren_depth += 1,
+                            ')' => {
+                                paren_depth -= 1;
+                                if paren_depth == 0 {
+                                    closed = true;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        if paren_depth >= 1 {
+                            params_text.push(ch);
+                        }
+                    }
+                    k += 1;
+                }
+            }
+            parse_leo_parameter_list(&params_text)
+        } else {
+            Vec::new()
+        };
+
         // Parse body: collect bindings and return line.
         let mut bindings = Vec::new();
         let mut return_line = None;
@@ -1581,6 +1665,7 @@ fn parse_leo_functions(source: &str) -> Vec<LeoFunctionDef> {
                 name,
                 is_transition,
                 line: line_num,
+                parameters,
                 bindings,
                 return_line,
             });
@@ -1590,6 +1675,54 @@ fn parse_leo_functions(source: &str) -> Vec<LeoFunctionDef> {
     }
 
     functions
+}
+
+/// Parse a Leo parameter list body (the text between the function-
+/// definition parens, excluding the parens themselves) and extract
+/// declared parameter names in source order.
+///
+/// Accepts comma-separated `name: type` (and `name: type.visibility`)
+/// declarations.  Tolerates leading visibility / mode keywords that
+/// the Leo language uses such as `public`, `private`, `constant` --
+/// the name is always the first identifier of each comma-separated
+/// segment, possibly preceded by a mode keyword.
+///
+/// Examples:
+///   ""                          -> []
+///   "a: u32"                    -> ["a"]
+///   "a: u32, b: u32"            -> ["a", "b"]
+///   "public a: u32"             -> ["a"]
+///   "owner: address, amount: u64" -> ["owner", "amount"]
+fn parse_leo_parameter_list(params_text: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    for raw in params_text.split(',') {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // The parameter form is `[mode ]<name>: <type>`.  Find the colon
+        // and walk back to the first identifier-shaped token.
+        let before_colon = match trimmed.find(':') {
+            Some(pos) => trimmed[..pos].trim(),
+            None => trimmed,
+        };
+        // Strip a leading visibility/mode keyword such as `public`,
+        // `private`, `constant`, `const`, `mut`.
+        let candidate = before_colon
+            .split_whitespace()
+            .last()
+            .unwrap_or("")
+            .trim();
+        if !candidate.is_empty()
+            && candidate
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_')
+            && !candidate.chars().next().is_some_and(|c| c.is_ascii_digit())
+        {
+            result.push(candidate.to_string());
+        }
+    }
+    result
 }
 
 /// Parse a Leo let-binding like `let a: u32 = 10u32;`.
@@ -1927,6 +2060,7 @@ function main:
             name: "compute".to_string(),
             is_transition: true,
             line: 2,
+            parameters: vec![],
             bindings: vec![
                 LeoBinding {
                     name: "a".to_string(),
@@ -2233,6 +2367,75 @@ function main:
         assert_eq!(result.registers[&4], 0);
         // get.or_use with default r1=100 -> r5 = 100
         assert_eq!(result.registers[&5], 100);
+    }
+
+    // -----------------------------------------------------------------------
+    // Leo parameter list parsing (audit (c) -- declared parameter names
+    // staged via TraceWriter::arg before register_call).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_leo_parameter_list_empty() {
+        assert!(parse_leo_parameter_list("").is_empty());
+        assert!(parse_leo_parameter_list("   ").is_empty());
+    }
+
+    #[test]
+    fn test_parse_leo_parameter_list_single() {
+        assert_eq!(parse_leo_parameter_list("a: u32"), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_leo_parameter_list_multiple() {
+        assert_eq!(
+            parse_leo_parameter_list("a: u32, b: u32"),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_parse_leo_parameter_list_visibility_modes() {
+        // Leo allows `public` / `private` / `constant` as mode keywords
+        // before each parameter; the parser must extract just the name.
+        assert_eq!(
+            parse_leo_parameter_list("public a: u32, private b: u32"),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_parse_leo_parameter_list_address_record() {
+        assert_eq!(
+            parse_leo_parameter_list("owner: address, amount: u64"),
+            vec!["owner".to_string(), "amount".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_parse_leo_functions_captures_parameters() {
+        let source = r#"program test.aleo {
+    transition transfer(receiver: address, amount: u64) -> u64 {
+        return amount;
+    }
+
+    transition compute() -> u32 {
+        let a: u32 = 10u32;
+        return a;
+    }
+}"#;
+        let functions = parse_leo_functions(source);
+        assert_eq!(functions.len(), 2);
+
+        // First transition has two declared parameters.
+        let transfer = &functions[0];
+        assert_eq!(transfer.name, "transfer");
+        assert_eq!(transfer.parameters, vec!["receiver", "amount"]);
+
+        // The parameterless transition has an empty parameter list (no
+        // false positives from the body / return statement).
+        let compute = &functions[1];
+        assert_eq!(compute.name, "compute");
+        assert!(compute.parameters.is_empty());
     }
 
     #[test]
