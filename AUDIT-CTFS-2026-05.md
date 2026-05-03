@@ -136,9 +136,10 @@ Verified post-fix by:
     `test_parse_leo_functions_captures_parameters` (end-to-end
     parser test with `transition transfer(receiver: address,
     amount: u64)`).
-  * `tests/test_ctfs_audit.rs::call_arg_staging_does_not_empty_trace`
-    (structural smoke test that the staging path on a parameterised
-    transition still produces a valid CTFS-magic `.ct` container).
+  * `tests/test_ctfs_audit.rs::ctfs_reader_sees_staged_call_args`
+    (read-side CTFS assertion that a parameterised transition's
+    staged names appear in `CallRecord.args` as `a` / `b` with the
+    canonical `NONE_VALUE` placeholder).
 
 ### (d) `Write` / `Error` / `EvmEvent` special-event routing — OPEN
 
@@ -284,11 +285,11 @@ The recorder uses the Rust API directly via the
      `Json` and `Ctfs` in the Nim writer cannot silently break
      the recorder.
 
-  5. **`tests/test_ctfs_audit.rs`** (new) — three audit tests:
+  5. **`tests/test_ctfs_audit.rs`** — four audit tests:
      `ctfs_writer_produces_ct_container`,
      `ctfs_format_advertised_in_record_help`,
      `ctfs_is_the_default_record_format`,
-     `call_arg_staging_does_not_empty_trace`.
+     `ctfs_reader_sees_staged_call_args`.
 
   6. **`src/tracer.rs` unit tests** — six new tests for the
      parameter-list parser plus an end-to-end
@@ -363,13 +364,16 @@ Once wired, the targeted Playwright spec
 `src/tests/gui/tests/program_specific_tests/leo_example.spec.ts`
 can exercise the recorder-side fixes end-to-end.
 
-### Reader-side end-to-end content assertions
+### Reader-side end-to-end content assertions — CLOSED for source-level args
 
-Add `codetracer_trace_reader_nim` as a `[dev-dependencies]` entry
-plus a small reader-walk helper, then assert that staged parameter
-names actually appear as `CallRecord.args[i].name` in the embedded
-event log.  Open for Cairo, Cardano, Flow, Fuel, PolkaVM, Miden,
-TON, Circom, and now Leo.
+`tests/test_ctfs_audit.rs::ctfs_reader_sees_staged_call_args` now
+opens the produced `.ct` container through `NimTraceReaderHandle`,
+walks `CallRecord` JSON, resolves each arg `varname_id`, and asserts
+that the parameterised source-level transition carries `a` / `b` in
+`CallRecord.args` with the canonical `NONE_VALUE` placeholder.  Replay-
+path live register arg readback remains a separate optional assertion;
+the recorder semantics were already covered by 1.59 and this follow-up
+only closes the source-level read-side assertion gap.
 
 ### Multi-stream IO event collapse
 
