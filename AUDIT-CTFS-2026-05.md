@@ -150,28 +150,35 @@ Verified post-fix by:
     / EVM `console_log`).  Same shape as Circom 1.58, Tolk 1.57,
     Miden 1.56, Cairo 1.50, Cardano 1.48.
 
-  * **Error**: OPEN.  Three error paths can fail today:
+  * **Error**: PARTIAL.  Three error paths can fail today:
 
     1. `compile_leo_to_aleo_via_cli` — `leo build` failure (compiler
        error, missing project layout, bad `.env`).  Falls back to
        the in-crate `generate_aleo_from_leo_source` generator, but
-       that path itself can fail on unsupported syntax.
+       that path itself can fail on unsupported syntax.  This final
+       compile/generation failure path is now routed through
+       `register_special_event(EventLogKind::Error,
+       "leo_compile_error", msg)` before the recorder returns the
+       error.  The partial trace is finalised, and
+       `tests/test_ctfs_audit.rs::ctfs_reader_sees_leo_compile_error_event`
+       opens it through `NimTraceReaderHandle` and asserts that a CTFS
+       `error` event with the failure message is readable.
     2. AVM interpreter (`tracer.rs::execute_function`) — division
        by zero, modulo by zero, unknown function name in `call`,
        recursion overflow (no recursion check today).
     3. `replay.rs::fetch_program` — RPC fetch failure (curl
        non-zero, empty response, malformed UTF-8).
 
-    All such errors today bubble up via `?` BEFORE the trace writer
-    is created, so no `register_special_event(Error, ...)` lands in
-    the `.ct` container — the user gets a CLI exit message but no
-    debuggable partial trace.  Concrete fix shape (mirrors Cardano
-    1.48 / Flow 1.52 / Tolk 1.57 closed pattern): create the trace
-    writer first, route compile/AVM/RPC failures through
-    `register_special_event(EventLogKind::Error, "<kind>", msg)`
-    with metadata such as `"leo_compile_error"`,
-    `"aleo_vm_error"`, `"aleo_rpc_error"`, finalise the partial
-    trace via the existing `finish_writing_*` calls.
+    The AVM and RPC paths still bubble up via `?` before a debuggable
+    Error event is finalised.  Concrete remaining fix shape (mirrors
+    Cardano 1.48 / Flow 1.52 / Tolk 1.57 closed pattern): route
+    AVM/RPC failures through `register_special_event(EventLogKind::Error,
+    "<kind>", msg)` with metadata `"avm_runtime_error"` /
+    `"aleo_rpc_error"`, and finalise the partial trace via the existing
+    `finish_writing_*` calls.  The current CTFS reader projection exposes
+    the Error kind and message bytes, but collapses the metadata string
+    (`leo_compile_error`) into the known multi-stream/event projection
+    boundary documented below.
 
   * **EvmEvent**: OPEN (two distinct cases).
 
@@ -285,17 +292,27 @@ The recorder uses the Rust API directly via the
      `Json` and `Ctfs` in the Nim writer cannot silently break
      the recorder.
 
-  5. **`tests/test_ctfs_audit.rs`** — four audit tests:
+  5. **`tests/test_ctfs_audit.rs`** — five audit tests:
      `ctfs_writer_produces_ct_container`,
      `ctfs_format_advertised_in_record_help`,
      `ctfs_is_the_default_record_format`,
-     `ctfs_reader_sees_staged_call_args`.
+     `ctfs_reader_sees_staged_call_args`,
+     `ctfs_reader_sees_leo_compile_error_event`.
 
   6. **`src/tracer.rs` unit tests** — six new tests for the
      parameter-list parser plus an end-to-end
      `test_parse_leo_functions_captures_parameters` test;
      existing `test_map_registers_to_variables` updated to set
      the new `parameters: vec![]` field.
+
+  7. **`src/tracer.rs` compile-error routing** — the record path now
+     catches final Leo compile/fallback-generation failures, writes a
+     partial trace with `register_special_event(EventLogKind::Error,
+     "leo_compile_error", msg)`, closes the implicit `<toplevel>` call,
+     finalises the CTFS container, then returns the original error.
+     The fallback generator now returns a concrete error when no Leo
+     `transition` or `function` declarations are found instead of
+     silently producing an empty Aleo program.
 
 ## Open follow-ups (not blocking; documented for future work)
 
@@ -320,13 +337,22 @@ Same shape as the Circom 1.58 "per-instance input-signal value
 resolution" follow-up and the TON 1.57 "Tolk parser extension for
 arg-passing call sites" follow-up.
 
-### Compile / AVM / RPC error routing (audit (d), Error)
+### Compile / AVM / RPC error routing (audit (d), Error) — PARTIAL
 
-Create the trace writer first, route compile / AVM / RPC failures
-through `register_special_event(EventLogKind::Error,
-"leo_compile_error" / "aleo_vm_error" / "aleo_rpc_error", msg)`,
-finalise the partial trace.  Same shape as Cardano 1.48 / Flow
-1.52 / Tolk 1.57 / Cairo 1.50 closed patterns.
+Compile/generation errors are now routed through
+`register_special_event(EventLogKind::Error, "leo_compile_error", msg)`
+before returning the recorder error, and the partial CTFS trace is
+finalised.  `tests/test_ctfs_audit.rs::ctfs_reader_sees_leo_compile_error_event`
+records invalid Leo source, opens the `.ct` through
+`NimTraceReaderHandle`, and asserts a readable CTFS `error` event whose
+message contains the compile/generation failure.  The reader-visible IO
+event projection exposes kind + data bytes but not the original metadata
+string, so metadata readback remains covered by the known multi-stream
+projection boundary below.
+
+AVM runtime failures and Aleo RPC fetch failures remain open.  Their next
+layer fix is the same finalise-on-error helper shape, with
+`"avm_runtime_error"` and `"aleo_rpc_error"` metadata respectively.
 
 ### Mapping operations as structured events (audit (d), EvmEvent)
 

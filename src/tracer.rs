@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
-use codetracer_trace_types::{Line, TypeKind, ValueRecord, NONE_VALUE};
+use codetracer_trace_types::{EventLogKind, Line, TypeKind, ValueRecord, NONE_VALUE};
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
 use codetracer_trace_writer_nim::{create_trace_writer, TraceEventsFileFormat};
 use eyre::{eyre, Context, Result};
@@ -293,7 +293,14 @@ impl LeoTracer {
         eprintln!("Parsed {} Leo functions from source", leo_functions.len());
 
         // -- 2. Compile Leo to Aleo instructions --
-        let aleo_source = compile_leo_to_aleo(source_path, source_code)?;
+        let aleo_source = match compile_leo_to_aleo(source_path, source_code) {
+            Ok(aleo) => aleo,
+            Err(error) => {
+                let message = format!("{error:#}");
+                write_error_trace(source_path, out_dir, format, "leo_compile_error", &message)?;
+                return Err(error);
+            }
+        };
 
         eprintln!(
             "Compiled Leo to {} bytes of Aleo instructions",
@@ -542,6 +549,47 @@ impl LeoTracer {
     }
 }
 
+fn write_error_trace(
+    source_path: &Path,
+    out_dir: &Path,
+    format: TraceEventsFileFormat,
+    metadata: &str,
+    message: &str,
+) -> Result<()> {
+    std::fs::create_dir_all(out_dir)
+        .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
+
+    let program_str = source_path.to_string_lossy();
+    let mut writer = create_trace_writer(&program_str, &[], format);
+
+    let events_filename = match format {
+        TraceEventsFileFormat::Json => "trace.json",
+        TraceEventsFileFormat::Binary
+        | TraceEventsFileFormat::BinaryV0
+        | TraceEventsFileFormat::Ctfs => "trace.bin",
+    };
+    let events_path = out_dir.join(events_filename);
+    let metadata_path = out_dir.join("trace_metadata.json");
+    let paths_path = out_dir.join("trace_paths.json");
+
+    TraceWriter::begin_writing_trace_events(&mut *writer, &events_path)
+        .map_err(|e| eyre!("{e}"))?;
+    TraceWriter::begin_writing_trace_metadata(&mut *writer, &metadata_path)
+        .map_err(|e| eyre!("{e}"))?;
+    TraceWriter::begin_writing_trace_paths(&mut *writer, &paths_path).map_err(|e| eyre!("{e}"))?;
+
+    TraceWriter::start(&mut *writer, source_path, Line(1));
+    TraceWriter::register_special_event(&mut *writer, EventLogKind::Error, metadata, message);
+    TraceWriter::register_return(&mut *writer, NONE_VALUE);
+
+    TraceWriter::finish_writing_trace_events(&mut *writer).map_err(|e| eyre!("{e}"))?;
+    TraceWriter::finish_writing_trace_metadata(&mut *writer).map_err(|e| eyre!("{e}"))?;
+    TraceWriter::finish_writing_trace_paths(&mut *writer).map_err(|e| eyre!("{e}"))?;
+    writer.close().map_err(|e| eyre!("{e}"))?;
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Leo compilation via `leo` CLI
 // ---------------------------------------------------------------------------
@@ -703,6 +751,11 @@ fn generate_aleo_from_leo_source(source_code: &str) -> Result<String> {
     let program_name = extract_program_name(source_code).unwrap_or_else(|| "main".to_string());
 
     let leo_fns = parse_leo_functions(source_code);
+    if leo_fns.is_empty() {
+        return Err(eyre!(
+            "fallback Leo-to-Aleo generation failed: no transition or function declarations found"
+        ));
+    }
     let mut aleo_output = format!("program {program_name}.aleo;\n\n");
 
     for func in &leo_fns {

@@ -7,6 +7,8 @@
 //! - (c) Transition parameter names are surfaced on `CallRecord.args`
 //!   via `TraceWriter::arg(name, NONE_VALUE)` staging so the
 //!   calltrace pane's `.call-arg` rows match the source.
+//! - (d) Compile/generation errors are surfaced as `EventLogKind::Error`
+//!   records with `leo_compile_error` metadata before the recorder aborts.
 
 use std::path::{Path, PathBuf};
 
@@ -64,6 +66,22 @@ fn decode_value_record(value: &serde_json::Value) -> ValueRecord {
     let bytes = bytes_from_json_array(value);
     cbor4ii::serde::from_slice(&bytes)
         .unwrap_or_else(|e| panic!("failed to decode ValueRecord from {bytes:?}: {e}"))
+}
+
+fn string_from_json_byte_array(value: &serde_json::Value) -> String {
+    String::from_utf8(bytes_from_json_array(value))
+        .unwrap_or_else(|e| panic!("expected UTF-8 byte array, got error: {e}"))
+}
+
+fn read_events(out_dir: &Path) -> Vec<serde_json::Value> {
+    let reader = open_ctfs_reader(out_dir);
+    (0..reader.event_count())
+        .map(|index| {
+            let json = reader.event_json(index).expect("read event JSON");
+            serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("invalid event JSON: {e}: {json}"))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -244,4 +262,52 @@ fn ctfs_reader_sees_staged_call_args() {
             "source-level Leo parameter values should decode as ValueRecord::None"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Audit (d) -- compile errors via register_special_event(Error, ...)
+// ---------------------------------------------------------------------------
+
+/// Even when the Leo compiler/fallback generator rejects the source, the
+/// recorder should leave a debuggable partial CTFS trace with a canonical
+/// Error event before returning the CLI/library error.
+#[test]
+fn ctfs_reader_sees_leo_compile_error_event() {
+    let tmp_src = tempfile::tempdir().expect("temp dir");
+    let leo_path = tmp_src.path().join("invalid.leo");
+    std::fs::write(
+        &leo_path,
+        "this is not a Leo program and declares no transition or function\n",
+    )
+    .expect("write invalid leo source");
+
+    let tmp_out = tempfile::tempdir().expect("temp dir");
+    let out_dir = tmp_out.path().join("compile-error-traces");
+
+    let err =
+        codetracer_leo_recorder::recorder::record(&leo_path, &out_dir, TraceEventsFileFormat::Ctfs)
+            .expect_err("invalid Leo source should fail recording");
+    assert!(
+        format!("{err:#}").contains("no transition or function declarations found"),
+        "unexpected compile/generation error: {err:#}"
+    );
+
+    let ct_path = first_ct_file(&out_dir);
+    let bytes = std::fs::read(&ct_path).expect("read compile-error .ct file");
+    assert_eq!(
+        &bytes[..CTFS_MAGIC.len()],
+        &CTFS_MAGIC,
+        "compile-error trace should still be a canonical CTFS container"
+    );
+
+    let events = read_events(&out_dir);
+    let error_event = events
+        .iter()
+        .find(|event| event["kind"].as_str() == Some("error"))
+        .unwrap_or_else(|| panic!("missing CTFS error event: {events:#?}"));
+    let content = string_from_json_byte_array(&error_event["data"]);
+    assert!(
+        content.contains("no transition or function declarations"),
+        "unexpected compile-error content: {content}"
+    );
 }
