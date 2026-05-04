@@ -318,7 +318,14 @@ impl LeoTracer {
         eprintln!("Generated Aleo-to-Leo source map");
 
         // -- 4. Execute the Aleo instructions --
-        let execution_results = execute_aleo_program(&aleo_functions)?;
+        let execution_results = match execute_aleo_program(&aleo_functions) {
+            Ok(results) => results,
+            Err(error) => {
+                let message = format!("{error:#}");
+                write_error_trace(source_path, out_dir, format, "avm_runtime_error", &message)?;
+                return Err(error);
+            }
+        };
 
         eprintln!(
             "Executed Aleo program, got {} function results",
