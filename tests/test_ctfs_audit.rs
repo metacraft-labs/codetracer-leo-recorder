@@ -7,8 +7,8 @@
 //! - (c) Transition parameter names are surfaced on `CallRecord.args`
 //!   via `TraceWriter::arg(name, NONE_VALUE)` staging so the
 //!   calltrace pane's `.call-arg` rows match the source.
-//! - (d) Compile/generation errors are surfaced as `EventLogKind::Error`
-//!   records with `leo_compile_error` metadata before the recorder aborts.
+//! - (d) Compile/generation errors and AVM runtime errors are surfaced
+//!   as `EventLogKind::Error` records before the recorder aborts.
 
 use std::path::{Path, PathBuf};
 
@@ -265,7 +265,7 @@ fn ctfs_reader_sees_staged_call_args() {
 }
 
 // ---------------------------------------------------------------------------
-// Audit (d) -- compile errors via register_special_event(Error, ...)
+// Audit (d) -- errors via register_special_event(Error, ...)
 // ---------------------------------------------------------------------------
 
 /// Even when the Leo compiler/fallback generator rejects the source, the
@@ -309,5 +309,54 @@ fn ctfs_reader_sees_leo_compile_error_event() {
     assert!(
         content.contains("no transition or function declarations"),
         "unexpected compile-error content: {content}"
+    );
+}
+
+/// AVM interpreter failures should use the same partial-trace contract as
+/// compiler/fallback-generation failures: emit a canonical Error event,
+/// finalise the CTFS container, then return the original runtime error.
+#[test]
+fn ctfs_reader_sees_avm_runtime_error_event() {
+    let tmp_src = tempfile::tempdir().expect("temp dir");
+    let leo_path = tmp_src.path().join("runtime_error.leo");
+    std::fs::write(
+        &leo_path,
+        r#"program runtime_error.aleo {
+    transition main() -> u32 {
+        let quotient: u32 = 10u32 / 0u32;
+        return quotient;
+    }
+}"#,
+    )
+    .expect("write runtime-error leo source");
+
+    let tmp_out = tempfile::tempdir().expect("temp dir");
+    let out_dir = tmp_out.path().join("avm-runtime-error-traces");
+
+    let err =
+        codetracer_leo_recorder::recorder::record(&leo_path, &out_dir, TraceEventsFileFormat::Ctfs)
+            .expect_err("division by zero should fail AVM execution");
+    assert!(
+        format!("{err:#}").contains("division by zero"),
+        "unexpected AVM runtime error: {err:#}"
+    );
+
+    let ct_path = first_ct_file(&out_dir);
+    let bytes = std::fs::read(&ct_path).expect("read AVM-runtime-error .ct file");
+    assert_eq!(
+        &bytes[..CTFS_MAGIC.len()],
+        &CTFS_MAGIC,
+        "AVM-runtime-error trace should still be a canonical CTFS container"
+    );
+
+    let events = read_events(&out_dir);
+    let error_event = events
+        .iter()
+        .find(|event| event["kind"].as_str() == Some("error"))
+        .unwrap_or_else(|| panic!("missing CTFS error event: {events:#?}"));
+    let content = string_from_json_byte_array(&error_event["data"]);
+    assert!(
+        content.contains("division by zero"),
+        "unexpected AVM-runtime-error content: {content}"
     );
 }

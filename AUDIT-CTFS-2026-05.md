@@ -165,20 +165,26 @@ Verified post-fix by:
        `error` event with the failure message is readable.
     2. AVM interpreter (`tracer.rs::execute_function`) — division
        by zero, modulo by zero, unknown function name in `call`,
-       recursion overflow (no recursion check today).
+       recursion overflow (no recursion check today).  Runtime
+       failures from `execute_aleo_program` are now routed through
+       `register_special_event(EventLogKind::Error,
+       "avm_runtime_error", msg)` before the recorder returns the
+       error.  The partial trace is finalised, and
+       `tests/test_ctfs_audit.rs::ctfs_reader_sees_avm_runtime_error_event`
+       opens it through `NimTraceReaderHandle` and asserts that a CTFS
+       `error` event with the runtime failure message is readable.
     3. `replay.rs::fetch_program` — RPC fetch failure (curl
        non-zero, empty response, malformed UTF-8).
 
-    The AVM and RPC paths still bubble up via `?` before a debuggable
+    The RPC path still bubbles up via `?` before a debuggable
     Error event is finalised.  Concrete remaining fix shape (mirrors
     Cardano 1.48 / Flow 1.52 / Tolk 1.57 closed pattern): route
-    AVM/RPC failures through `register_special_event(EventLogKind::Error,
-    "<kind>", msg)` with metadata `"avm_runtime_error"` /
-    `"aleo_rpc_error"`, and finalise the partial trace via the existing
+    RPC failures through `register_special_event(EventLogKind::Error,
+    "aleo_rpc_error", msg)`, and finalise the partial trace via the existing
     `finish_writing_*` calls.  The current CTFS reader projection exposes
     the Error kind and message bytes, but collapses the metadata string
-    (`leo_compile_error`) into the known multi-stream/event projection
-    boundary documented below.
+    (`leo_compile_error` / `avm_runtime_error`) into the known
+    multi-stream/event projection boundary documented below.
 
   * **EvmEvent**: OPEN (two distinct cases).
 
@@ -292,12 +298,13 @@ The recorder uses the Rust API directly via the
      `Json` and `Ctfs` in the Nim writer cannot silently break
      the recorder.
 
-  5. **`tests/test_ctfs_audit.rs`** — five audit tests:
+  5. **`tests/test_ctfs_audit.rs`** — six audit tests:
      `ctfs_writer_produces_ct_container`,
      `ctfs_format_advertised_in_record_help`,
      `ctfs_is_the_default_record_format`,
      `ctfs_reader_sees_staged_call_args`,
-     `ctfs_reader_sees_leo_compile_error_event`.
+     `ctfs_reader_sees_leo_compile_error_event`,
+     `ctfs_reader_sees_avm_runtime_error_event`.
 
   6. **`src/tracer.rs` unit tests** — six new tests for the
      parameter-list parser plus an end-to-end
@@ -313,6 +320,12 @@ The recorder uses the Rust API directly via the
      The fallback generator now returns a concrete error when no Leo
      `transition` or `function` declarations are found instead of
      silently producing an empty Aleo program.
+
+  8. **`src/tracer.rs` AVM runtime-error routing** — the record path now
+     catches `execute_aleo_program` failures, writes a partial trace with
+     `register_special_event(EventLogKind::Error, "avm_runtime_error",
+     msg)`, closes the implicit `<toplevel>` call, finalises the CTFS
+     container, then returns the original runtime error.
 
 ## Open follow-ups (not blocking; documented for future work)
 
@@ -350,9 +363,15 @@ event projection exposes kind + data bytes but not the original metadata
 string, so metadata readback remains covered by the known multi-stream
 projection boundary below.
 
-AVM runtime failures and Aleo RPC fetch failures remain open.  Their next
-layer fix is the same finalise-on-error helper shape, with
-`"avm_runtime_error"` and `"aleo_rpc_error"` metadata respectively.
+AVM runtime failures from the record path are now routed through
+`register_special_event(EventLogKind::Error, "avm_runtime_error", msg)`.
+`tests/test_ctfs_audit.rs::ctfs_reader_sees_avm_runtime_error_event`
+records a division-by-zero program, opens the `.ct` through
+`NimTraceReaderHandle`, and asserts a readable CTFS `error` event whose
+message contains the runtime failure.
+
+Aleo RPC fetch failures remain open.  Their next layer fix is the same
+finalise-on-error helper shape, with `"aleo_rpc_error"` metadata.
 
 ### Mapping operations as structured events (audit (d), EvmEvent)
 
