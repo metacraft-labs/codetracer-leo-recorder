@@ -19,6 +19,12 @@ use codetracer_trace_writer_nim::trace_writer::TraceWriter;
 use codetracer_trace_writer_nim::{create_trace_writer, TraceEventsFileFormat};
 use eyre::{eyre, Context, Result};
 
+// The recorder is CTFS-only per `Recorder-CLI-Conventions.md` §4 (see
+// `codetracer-specs`).  Pin every `create_trace_writer` call site to the
+// canonical multi-stream container so the replay path cannot drift away
+// from the contract enforced on the record path.
+const CTFS_FORMAT: TraceEventsFileFormat = TraceEventsFileFormat::Ctfs;
+
 use crate::tracer::{
     parse_aleo_program, resolve_operand, AleoFunction, AleoInstruction, FunctionResult,
     MappingStore, Operand,
@@ -227,17 +233,13 @@ fn parse_input_value(input: &str) -> Result<i64> {
 /// 2. Parses the Aleo Instructions source.
 /// 3. Executes the specified function through the AVM interpreter.
 /// 4. Writes CodeTracer trace output files to `out_dir`.
-pub fn replay_program(
-    config: &ReplayConfig,
-    out_dir: &Path,
-    format: TraceEventsFileFormat,
-) -> Result<()> {
+pub fn replay_program(config: &ReplayConfig, out_dir: &Path) -> Result<()> {
     // 1. Fetch the deployed program.
     let client = AleoRpcClient::new(&config.endpoint);
     let deployed = fetch_program(&client, &config.program_id)
         .with_context(|| format!("failed to fetch program {}", config.program_id))?;
 
-    replay_deployed_program(&deployed, config, out_dir, format)
+    replay_deployed_program(&deployed, config, out_dir)
 }
 
 /// Replay a pre-fetched deployed program (used internally and in tests).
@@ -245,7 +247,6 @@ pub fn replay_deployed_program(
     deployed: &DeployedProgram,
     config: &ReplayConfig,
     out_dir: &Path,
-    format: TraceEventsFileFormat,
 ) -> Result<()> {
     eprintln!(
         "Fetched program {} ({} bytes of Aleo Instructions)",
@@ -311,17 +312,12 @@ pub fn replay_deployed_program(
     std::fs::write(&source_path, &deployed.source)
         .with_context(|| format!("failed to write source file: {}", source_path.display()))?;
 
-    // Create trace writer.
+    // Create trace writer (CTFS only).
     let program_str = source_path.to_string_lossy().to_string();
-    let mut writer = create_trace_writer(&program_str, &[], format);
+    let mut writer = create_trace_writer(&program_str, &[], CTFS_FORMAT);
 
-    let events_filename = match format {
-        TraceEventsFileFormat::Json => "trace.json",
-        TraceEventsFileFormat::Binary
-        | TraceEventsFileFormat::BinaryV0
-        | TraceEventsFileFormat::Ctfs => "trace.bin",
-    };
-    let events_path = out_dir.join(events_filename);
+    // CTFS-only writer — events stream lives in `trace.bin`.
+    let events_path = out_dir.join("trace.bin");
     let metadata_path = out_dir.join("trace_metadata.json");
     let paths_path = out_dir.join("trace_paths.json");
 
@@ -382,10 +378,7 @@ pub fn replay_deployed_program(
     let target_func = func_map[config.function_name.as_str()];
     for (idx, (reg_idx, type_name)) in target_func.inputs.iter().enumerate() {
         let arg_name = format!("r{}", reg_idx);
-        let arg_type_id = type_ids
-            .get(type_name)
-            .copied()
-            .unwrap_or(u32_type_id);
+        let arg_type_id = type_ids.get(type_name).copied().unwrap_or(u32_type_id);
         let arg_value = if idx < input_values.len() {
             ValueRecord::Int {
                 i: input_values[idx],
@@ -753,12 +746,7 @@ mod tests {
         };
 
         let out_dir = tempfile::tempdir().unwrap();
-        let result = replay_deployed_program(
-            &deployed,
-            &config,
-            out_dir.path(),
-            TraceEventsFileFormat::Json,
-        );
+        let result = replay_deployed_program(&deployed, &config, out_dir.path());
 
         assert!(result.is_ok(), "replay failed: {:?}", result.err());
 
@@ -767,12 +755,19 @@ mod tests {
             .expect("read output dir")
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.extension().map_or(false, |ext| ext == "ct"))
+            .filter(|p| p.extension().is_some_and(|ext| ext == "ct"))
             .collect();
-        assert!(!ct_files.is_empty(), "expected at least one .ct file in output dir");
+        assert!(
+            !ct_files.is_empty(),
+            "expected at least one .ct file in output dir"
+        );
         let content = std::fs::read(&ct_files[0]).expect("read .ct file");
         assert!(content.len() >= 5, ".ct file too small");
-        assert_eq!(&content[..5], &[0xC0u8, 0xDE, 0x72, 0xAC, 0xE2], "CTFS magic bytes mismatch");
+        assert_eq!(
+            &content[..5],
+            &[0xC0u8, 0xDE, 0x72, 0xAC, 0xE2],
+            "CTFS magic bytes mismatch"
+        );
 
         // Verify the source file was written.
         assert!(out_dir.path().join("hello.aleo").exists());
@@ -793,12 +788,7 @@ mod tests {
         };
 
         let out_dir = tempfile::tempdir().unwrap();
-        let result = replay_deployed_program(
-            &deployed,
-            &config,
-            out_dir.path(),
-            TraceEventsFileFormat::Json,
-        );
+        let result = replay_deployed_program(&deployed, &config, out_dir.path());
 
         assert!(result.is_ok(), "replay failed: {:?}", result.err());
 
@@ -823,12 +813,7 @@ mod tests {
         };
 
         let out_dir = tempfile::tempdir().unwrap();
-        let result = replay_deployed_program(
-            &deployed,
-            &config,
-            out_dir.path(),
-            TraceEventsFileFormat::Json,
-        );
+        let result = replay_deployed_program(&deployed, &config, out_dir.path());
 
         assert!(result.is_err());
         let err_msg = format!("{:?}", result.err().unwrap());

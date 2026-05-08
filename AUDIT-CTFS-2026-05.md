@@ -465,3 +465,135 @@ hybrid shape and stage call args at BOTH the source-language level
 (declared parameter names with NONE_VALUE) AND the compiled-bytecode
 level (live register values), choosing the layer that matches the
 trace-emission boundary.
+
+## Convention compliance follow-up — 2026-05-08
+
+The 2026-05-02 audit landed a `--format ctfs|binary|json` `clap::ValueEnum`
+defaulting to `Ctfs`, mirroring the EVM (1.39) / Solana (1.44) /
+Move (1.46) / Cardano (1.48) / Cairo (1.50) / Flow (1.52) / Fuel
+(1.53) / PolkaVM (1.55) / Miden (1.56) / TON (1.57) / Circom (1.58)
+audits.  Subsequent to that audit,
+`Recorder-CLI-Conventions.md` §4 in `codetracer-specs` was tightened
+to require **CTFS-only** output: recorders no longer accept a
+`--format` flag and `ct print` (shipped with
+`codetracer-trace-format-nim`) is the canonical conversion tool for
+human-readable output.  `Repo-Requirements.md` §2.2 / §2.3 reflect
+this contract.
+
+This entry records the convention compliance follow-up applied to the
+Leo recorder on 2026-05-08, mirroring the cairo (2710b5e), cardano
+(0698f00), circom (2d8b280), flow (49a4fa9) and fuel (0ec716d)
+precedents:
+
+* The `--format` / `-f` CLI flag was removed from both the `record`
+  and `replay` subcommands.  The `OutputFormat` enum, the
+  `impl From<OutputFormat> for TraceEventsFileFormat` block and the
+  `OutputFormat::as_str` helper were deleted from `src/main.rs`.
+  Clap rejects `--format <anything>` with an "unexpected argument"
+  diagnostic (verified by `test_format_flag_rejected_by_clap`).
+* The `format` parameter was removed from
+  `codetracer_leo_recorder::recorder::record`,
+  `LeoTracer::trace_program`, the in-tracer `write_error_trace`
+  helper, `replay::replay_program` and
+  `replay::replay_deployed_program`.  Each `create_trace_writer`
+  call site is hard-pinned to a module-level
+  `const CTFS_FORMAT: TraceEventsFileFormat = TraceEventsFileFormat::Ctfs;`.
+  The `events_filename` match (which used to dispatch on
+  `Json` / `Binary` / `BinaryV0` / `Ctfs`) was collapsed to the
+  single CTFS arm (`trace.bin`) at every site.
+* `CODETRACER_LEO_RECORDER_OUT_DIR` was added as a fallback for
+  `--out-dir` on both the `record` and `replay` subcommands.  Lookup
+  order is CLI flag → env var → `./ct-traces/`.
+* `CODETRACER_LEO_RECORDER_DISABLED=1` (or `true`) skips the trace
+  emission entirely on both `record` and `replay`; the Leo recorder
+  doesn't run a separate target subprocess so "disabled" simply means
+  "don't write any artefacts".
+* `CODETRACER_LEO_RECORDER_LOG_LEVEL` is documented (advisory) in the
+  `--help` output and the README.
+* The CTFS-only contract is now in force across the codebase: the
+  binary's `--help` output mentions `ct print` as the conversion tool;
+  the README documents only CTFS, the env-var contract, and the
+  `ct print` workflow.
+* `tests/test_tracer.rs` was rewritten:
+  - The pre-existing CLI fixture test `test_leo_cli_record` no
+    longer passes `--format ctfs`; it invokes the recorder via the
+    `CARGO_BIN_EXE_*` env var instead of `cargo run` so it exercises
+    the released binary directly.
+  - The other smoke tests (`test_leo_compile_and_run`,
+    `test_leo_compute_value`, `test_leo_variable_values`,
+    `test_leo_step_events`, `test_leo_metadata_structure`,
+    `test_leo_function_calls`, `test_traced_steps_reference_leo_lines`)
+    were already operating in pure structural mode (CTFS magic +
+    file-size lower bound); they were updated to call
+    `record(source_path, out_dir)` (no `format` argument) and now
+    share a `run_tracer_on_file` helper that hard-codes the CTFS
+    contract on the recorder side.  No `#[ignore]`-only tests
+    existed in this file prior to the rewrite, so none were
+    deleted.
+  - `test_recorded_trace_via_ct_print_json` (new) drives the
+    recorder against the canonical `flow_test.leo` fixture, pipes
+    the .ct bundle through `ct-print --json`, and asserts on
+    **structural anchors** — the fixture source path filename
+    (`flow_test.leo`) and at least one of the Leo source variable
+    names (`a` / `b` / `sum_val` / `doubled` / `final_result`) —
+    rather than on integer values, because the Leo recorder's
+    `ValueRecord::Int { i, type_id }` payload doesn't round-trip
+    through `ct-print` today (same pre-existing limitation as
+    cardano / circom / flow / fuel).  Skips gracefully when
+    `ct-print` is not present (i.e. when this crate is built
+    outside the metacraft workspace).
+  - `test_env_out_dir_used_when_flag_omitted` (new) records a Leo
+    fixture without `--out-dir`, sets
+    `CODETRACER_LEO_RECORDER_OUT_DIR` to a tempdir path, and
+    asserts the `.ct` bundle landed in the env-supplied directory.
+  - `test_env_disabled_skips_recording` (new) records with
+    `CODETRACER_LEO_RECORDER_DISABLED=1` and asserts no artefacts
+    were produced (recorder still exits 0).
+  - `test_format_flag_rejected_by_clap` (new) confirms clap
+    rejection of `--format json`.
+  - `test_no_format_flag_in_help` (new) walks top-level / record /
+    replay `--help` and asserts neither `--format` nor
+    `CODETRACER_FORMAT` is advertised.
+  - `test_help_mentions_ct_print` (new) asserts the conversion-tool
+    pointer is present in `--help`.
+* `tests/test_ctfs_audit.rs` was updated:
+  - The pre-existing `ctfs_format_advertised_in_record_help` and
+    `ctfs_is_the_default_record_format` tests were deleted (they
+    asserted on the `[default: ctfs]` clap doc string; with the
+    flag gone, they would lock in the regression).  Their content
+    coverage is preserved by `test_no_format_flag_in_help` /
+    `test_help_mentions_ct_print` / `test_format_flag_rejected_by_clap`
+    in `tests/test_tracer.rs` plus the new
+    `test_recorded_trace_via_ct_print_json` ct-print round-trip.
+    Neither was `#[ignore]`'d at the time of deletion.
+  - `ctfs_writer_produces_ct_container`,
+    `ctfs_reader_sees_staged_call_args`,
+    `ctfs_reader_sees_leo_compile_error_event`,
+    `ctfs_reader_sees_avm_runtime_error_event` survive unchanged
+    in spirit; their `record(...)` call sites now omit the
+    `TraceEventsFileFormat::Ctfs` argument.
+* `src/replay.rs` unit tests (`test_replay_hello_program`,
+  `test_replay_arithmetic_program`, `test_replay_function_not_found`)
+  were updated to drop the `TraceEventsFileFormat::Json` argument
+  from their `replay_deployed_program` call sites.
+* `tests/verify-cli-convention-no-silent-skip.sh` was added as a
+  shell-level guard that runs the binary's `--help`, asserts
+  `--format` and `CODETRACER_FORMAT` are absent, asserts the standard
+  flags (`--out-dir`, `--version`) are present, asserts `ct print` is
+  mentioned, and asserts the `CODETRACER_LEO_RECORDER_OUT_DIR` /
+  `CODETRACER_LEO_RECORDER_DISABLED` env vars are referenced in
+  source.  A `Justfile` was added at repo root to wire it into
+  `just lint` / `just test`.
+* `README.md` was updated to drop the `--format` documentation and
+  document the CTFS-only contract, the env-var contract, and the
+  `ct print` workflow.
+
+References:
+
+* [`codetracer-specs/Recorder-CLI-Conventions.md`](../codetracer-specs/Recorder-CLI-Conventions.md) §4 (CTFS-only) and §5 (env vars).
+* [`codetracer-specs/Repo-Requirements.md`](../codetracer-specs/Repo-Requirements.md) §2.2 (CLI compliance) and §2.3 (trace format compatibility).
+* Cairo precedent: `codetracer-cairo-recorder` commit `2710b5e`.
+* Cardano follow-up: `codetracer-cardano-recorder` commit `0698f00`.
+* Circom follow-up: `codetracer-circom-recorder` commit `2d8b280`.
+* Flow follow-up: `codetracer-flow-recorder` commit `49a4fa9`.
+* Fuel follow-up: `codetracer-fuel-recorder` commit `0ec716d`.
