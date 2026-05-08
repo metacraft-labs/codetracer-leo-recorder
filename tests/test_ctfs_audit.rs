@@ -2,8 +2,12 @@
 //!
 //! Closes audit gaps documented in AUDIT-CTFS-2026-05.md:
 //!
-//! - (a) `--format ctfs` is the default; the CLI advertises it and
-//!   produces the canonical multi-stream `.ct` container by default.
+//! - (a) The recorder writes the canonical multi-stream `.ct` container
+//!   (CTFS-only post-2026-05-08).  The previous
+//!   `ctfs_format_advertised_in_record_help` and
+//!   `ctfs_is_the_default_record_format` tests were tied to the
+//!   `--format` flag and were replaced by `test_no_format_flag_in_help`
+//!   / `test_help_mentions_ct_print` in `tests/test_tracer.rs`.
 //! - (c) Transition parameter names are surfaced on `CallRecord.args`
 //!   via `TraceWriter::arg(name, NONE_VALUE)` staging so the
 //!   calltrace pane's `.call-arg` rows match the source.
@@ -13,7 +17,7 @@
 use std::path::{Path, PathBuf};
 
 use codetracer_trace_types::{ValueRecord, NONE_VALUE};
-use codetracer_trace_writer_nim::{NimTraceReaderHandle, TraceEventsFileFormat};
+use codetracer_trace_writer_nim::NimTraceReaderHandle;
 
 /// CTFS magic bytes: C0 DE 72 AC E2.
 ///
@@ -85,11 +89,17 @@ fn read_events(out_dir: &Path) -> Vec<serde_json::Value> {
 }
 
 // ---------------------------------------------------------------------------
-// Audit (a) -- default-Ctfs CLI + canonical multi-stream `.ct` container
+// Audit (a) -- canonical multi-stream `.ct` container (CTFS-only)
 // ---------------------------------------------------------------------------
 
-/// Recording with `TraceEventsFileFormat::Ctfs` produces a `.ct` container
-/// whose first 5 bytes match the canonical CTFS magic.
+/// Recording produces a `.ct` container whose first 5 bytes match the
+/// canonical CTFS magic.  Post-2026-05-08 the recorder is CTFS-only —
+/// `record` no longer takes a `format` parameter and the legacy
+/// `ctfs_format_advertised_in_record_help` /
+/// `ctfs_is_the_default_record_format` tests were replaced by the
+/// `test_no_format_flag_in_help` / `test_help_mentions_ct_print` /
+/// `test_format_flag_rejected_by_clap` invariants in
+/// `tests/test_tracer.rs`.
 #[test]
 fn ctfs_writer_produces_ct_container() {
     let tmp_dir = tempfile::tempdir().expect("temp dir");
@@ -97,7 +107,7 @@ fn ctfs_writer_produces_ct_container() {
     std::fs::create_dir_all(&out_dir).unwrap();
 
     let source_path = test_programs_dir().join("flow_test.leo");
-    codetracer_leo_recorder::recorder::record(&source_path, &out_dir, TraceEventsFileFormat::Ctfs)
+    codetracer_leo_recorder::recorder::record(&source_path, &out_dir)
         .expect("record should succeed");
 
     let ct_path = first_ct_file(&out_dir);
@@ -111,73 +121,6 @@ fn ctfs_writer_produces_ct_container() {
         &bytes[..CTFS_MAGIC.len()],
         &CTFS_MAGIC,
         ".ct container should start with the canonical CTFS magic"
-    );
-}
-
-/// `record --help` advertises the Ctfs format and lists it as the default.
-///
-/// Same idiom as the audited recorders (Flow 1.52 / Fuel 1.53 / PolkaVM 1.55
-/// / Miden 1.56 / TON 1.57 / Circom 1.58).
-#[test]
-fn ctfs_format_advertised_in_record_help() {
-    let output = std::process::Command::new(env!("CARGO"))
-        .args(["run", "--quiet", "--", "record", "--help"])
-        .output()
-        .expect("failed to run record --help");
-
-    assert!(
-        output.status.success(),
-        "record --help should succeed, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("ctfs"),
-        "record --help should advertise the `ctfs` format value, got:\n{}",
-        stdout
-    );
-    assert!(
-        stdout.contains("[default: ctfs]"),
-        "record --help should advertise `ctfs` as the DEFAULT format, got:\n{}",
-        stdout
-    );
-}
-
-/// Invoking `record` without `--format` produces a CTFS-magic `.ct`
-/// container, proving that `ctfs` is the wired-through default.
-#[test]
-fn ctfs_is_the_default_record_format() {
-    let tmp_dir = tempfile::tempdir().expect("temp dir");
-    let out_dir = tmp_dir.path().join("default-format-traces");
-    let source_path = test_programs_dir().join("flow_test.leo");
-
-    let output = std::process::Command::new(env!("CARGO"))
-        .args([
-            "run",
-            "--quiet",
-            "--",
-            "record",
-            source_path.to_str().unwrap(),
-            "--out-dir",
-            out_dir.to_str().unwrap(),
-        ])
-        .output()
-        .expect("failed to run record");
-
-    assert!(
-        output.status.success(),
-        "default-format record should succeed, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let ct_path = first_ct_file(&out_dir);
-    let bytes = std::fs::read(&ct_path).expect("read .ct file");
-    assert!(bytes.len() >= CTFS_MAGIC.len(), ".ct file too small");
-    assert_eq!(
-        &bytes[..CTFS_MAGIC.len()],
-        &CTFS_MAGIC,
-        "default-format .ct should be a canonical CTFS container"
     );
 }
 
@@ -212,8 +155,7 @@ fn ctfs_reader_sees_staged_call_args() {
     let out_dir = tmp_out.path().join("staging-traces");
     std::fs::create_dir_all(&out_dir).unwrap();
 
-    codetracer_leo_recorder::recorder::record(&leo_path, &out_dir, TraceEventsFileFormat::Ctfs)
-        .expect("record should succeed");
+    codetracer_leo_recorder::recorder::record(&leo_path, &out_dir).expect("record should succeed");
 
     let ct_path = first_ct_file(&out_dir);
     let bytes = std::fs::read(&ct_path).expect("read .ct file");
@@ -284,9 +226,8 @@ fn ctfs_reader_sees_leo_compile_error_event() {
     let tmp_out = tempfile::tempdir().expect("temp dir");
     let out_dir = tmp_out.path().join("compile-error-traces");
 
-    let err =
-        codetracer_leo_recorder::recorder::record(&leo_path, &out_dir, TraceEventsFileFormat::Ctfs)
-            .expect_err("invalid Leo source should fail recording");
+    let err = codetracer_leo_recorder::recorder::record(&leo_path, &out_dir)
+        .expect_err("invalid Leo source should fail recording");
     assert!(
         format!("{err:#}").contains("no transition or function declarations found"),
         "unexpected compile/generation error: {err:#}"
@@ -333,9 +274,8 @@ fn ctfs_reader_sees_avm_runtime_error_event() {
     let tmp_out = tempfile::tempdir().expect("temp dir");
     let out_dir = tmp_out.path().join("avm-runtime-error-traces");
 
-    let err =
-        codetracer_leo_recorder::recorder::record(&leo_path, &out_dir, TraceEventsFileFormat::Ctfs)
-            .expect_err("division by zero should fail AVM execution");
+    let err = codetracer_leo_recorder::recorder::record(&leo_path, &out_dir)
+        .expect_err("division by zero should fail AVM execution");
     assert!(
         format!("{err:#}").contains("division by zero"),
         "unexpected AVM runtime error: {err:#}"

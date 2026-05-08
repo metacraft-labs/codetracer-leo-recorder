@@ -21,6 +21,13 @@ use codetracer_trace_writer_nim::trace_writer::TraceWriter;
 use codetracer_trace_writer_nim::{create_trace_writer, TraceEventsFileFormat};
 use eyre::{eyre, Context, Result};
 
+// The recorder is CTFS-only per `Recorder-CLI-Conventions.md` §4 (see
+// `codetracer-specs`).  We pin every `create_trace_writer` call site to
+// this constant so the tracer surface no longer carries a `format`
+// parameter and the writer cannot accidentally drift away from the
+// canonical multi-stream container.
+const CTFS_FORMAT: TraceEventsFileFormat = TraceEventsFileFormat::Ctfs;
+
 use crate::source_map::{generate_source_map, AleoSourceMap, SourceMap};
 
 // ---------------------------------------------------------------------------
@@ -280,12 +287,7 @@ impl LeoTracer {
     /// 3. Executes the Aleo instructions using a built-in AVM interpreter.
     /// 4. Maps computed values back to Leo source variables.
     /// 5. Emits Step, Call, Return, and Value trace events.
-    pub fn trace_program(
-        source_path: &Path,
-        source_code: &str,
-        out_dir: &Path,
-        format: TraceEventsFileFormat,
-    ) -> Result<()> {
+    pub fn trace_program(source_path: &Path, source_code: &str, out_dir: &Path) -> Result<()> {
         // -- 1. Parse Leo source for variable/function mappings --
         let _source_map = SourceMap::from_source(source_path, source_code);
         let leo_functions = parse_leo_functions(source_code);
@@ -297,7 +299,7 @@ impl LeoTracer {
             Ok(aleo) => aleo,
             Err(error) => {
                 let message = format!("{error:#}");
-                write_error_trace(source_path, out_dir, format, "leo_compile_error", &message)?;
+                write_error_trace(source_path, out_dir, "leo_compile_error", &message)?;
                 return Err(error);
             }
         };
@@ -322,7 +324,7 @@ impl LeoTracer {
             Ok(results) => results,
             Err(error) => {
                 let message = format!("{error:#}");
-                write_error_trace(source_path, out_dir, format, "avm_runtime_error", &message)?;
+                write_error_trace(source_path, out_dir, "avm_runtime_error", &message)?;
                 return Err(error);
             }
         };
@@ -340,10 +342,10 @@ impl LeoTracer {
             eprintln!("  {name} = {val}");
         }
 
-        // -- 6. Create the trace writer --
+        // -- 6. Create the trace writer (CTFS only) --
         let program_str = source_path.to_string_lossy();
         let mut tracer = LeoTracer {
-            writer: create_trace_writer(&program_str, &[], format),
+            writer: create_trace_writer(&program_str, &[], CTFS_FORMAT),
             type_ids: HashMap::new(),
         };
 
@@ -351,13 +353,8 @@ impl LeoTracer {
         std::fs::create_dir_all(out_dir)
             .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
 
-        let events_filename = match format {
-            TraceEventsFileFormat::Json => "trace.json",
-            TraceEventsFileFormat::Binary
-            | TraceEventsFileFormat::BinaryV0
-            | TraceEventsFileFormat::Ctfs => "trace.bin",
-        };
-        let events_path = out_dir.join(events_filename);
+        // CTFS-only writer — events stream lives in `trace.bin`.
+        let events_path = out_dir.join("trace.bin");
         let metadata_path = out_dir.join("trace_metadata.json");
         let paths_path = out_dir.join("trace_paths.json");
 
@@ -559,7 +556,6 @@ impl LeoTracer {
 fn write_error_trace(
     source_path: &Path,
     out_dir: &Path,
-    format: TraceEventsFileFormat,
     metadata: &str,
     message: &str,
 ) -> Result<()> {
@@ -567,15 +563,10 @@ fn write_error_trace(
         .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
 
     let program_str = source_path.to_string_lossy();
-    let mut writer = create_trace_writer(&program_str, &[], format);
+    let mut writer = create_trace_writer(&program_str, &[], CTFS_FORMAT);
 
-    let events_filename = match format {
-        TraceEventsFileFormat::Json => "trace.json",
-        TraceEventsFileFormat::Binary
-        | TraceEventsFileFormat::BinaryV0
-        | TraceEventsFileFormat::Ctfs => "trace.bin",
-    };
-    let events_path = out_dir.join(events_filename);
+    // CTFS-only writer — events stream lives in `trace.bin`.
+    let events_path = out_dir.join("trace.bin");
     let metadata_path = out_dir.join("trace_metadata.json");
     let paths_path = out_dir.join("trace_paths.json");
 
@@ -1631,9 +1622,7 @@ fn parse_leo_functions(source: &str) -> Vec<LeoFunctionDef> {
                     }
                     _ => {}
                 }
-                if paren_depth >= 1
-                    && !(ch == '(' && paren_depth == 1 && params_text.is_empty())
-                {
+                if paren_depth >= 1 && !(ch == '(' && paren_depth == 1 && params_text.is_empty()) {
                     params_text.push(ch);
                 }
             }
@@ -1768,15 +1757,9 @@ fn parse_leo_parameter_list(params_text: &str) -> Vec<String> {
         };
         // Strip a leading visibility/mode keyword such as `public`,
         // `private`, `constant`, `const`, `mut`.
-        let candidate = before_colon
-            .split_whitespace()
-            .last()
-            .unwrap_or("")
-            .trim();
+        let candidate = before_colon.split_whitespace().last().unwrap_or("").trim();
         if !candidate.is_empty()
-            && candidate
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '_')
+            && candidate.chars().all(|c| c.is_alphanumeric() || c == '_')
             && !candidate.chars().next().is_some_and(|c| c.is_ascii_digit())
         {
             result.push(candidate.to_string());
