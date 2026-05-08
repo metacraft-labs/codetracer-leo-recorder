@@ -203,21 +203,28 @@ fn test_traced_steps_reference_leo_lines() {
 // assertions
 // ---------------------------------------------------------------------------
 
-/// Record the canonical `flow_test.leo` fixture, then convert the
-/// produced `.ct` container to JSON via `ct-print --json` and assert on
-/// the textual representation.
+/// Record `flow_test.leo`, then convert the produced `.ct` container to
+/// JSON via `ct-print` and assert on:
 ///
-/// Pre-2026-05-08 the recorder shipped a `--format json` mode and a
-/// trace.json file was written directly.  The convention now mandates
+/// 1. **Structural anchors** (legacy layer): `ct-print --json` output
+///    contains the source filename / variable names / canonical u32
+///    values somewhere in the textual rendering.
+/// 2. **Exact decoded values** (the layer enabled by `ct-print --full`):
+///    the `flow_test.leo` program executes `(10 + 32) * 2 + 10 = 94`
+///    via the `compute()` transition, with intermediate let-bindings
+///    `a=10`, `b=32`, `sum_val=42`, `doubled=84`, `final_result=94`.
+///    Each binding must surface in the trace as a step event with a
+///    decoded `Int` ValueRecord whose `i` field matches the literal
+///    value from the source program.
+///
+/// Pre-2026-05-08 this assertion was made directly on a recorder-emitted
+/// `trace.json` file (via `--format json`).  The convention now mandates
 /// CTFS-only output; `ct print` is the canonical conversion tool.  See
-/// `Recorder-CLI-Conventions.md` §4.
-///
-/// The Leo recorder's variable payload (Aleo register values encoded as
-/// `ValueRecord::Int { i, type_id }`) does not round-trip through
-/// `ct print --json` today (same pre-existing limitation as cardano /
-/// circom / flow / fuel), so this test asserts on **structural anchors**
-/// — the fixture's source path file name and at least one of the Leo
-/// source variable names — rather than on integer values.
+/// `Recorder-CLI-Conventions.md` §4.  `ct-print --full` (added 2026-05
+/// in `codetracer-trace-format-nim`) is what enables the exact-value
+/// layer — its output is a deterministic JSON document with every CBOR
+/// `ValueRecord` decoded to a structured form like
+/// `{"kind":"Int","i":42,"type_id":6}`.
 #[test]
 fn test_recorded_trace_via_ct_print_json() {
     let ct_print = ct_print_path();
@@ -239,7 +246,11 @@ fn test_recorded_trace_via_ct_print_json() {
 
     let ct_path = assert_valid_ct_file(&out_dir);
 
-    // ct-print --json <file.ct>
+    // -----------------------------------------------------------------
+    // Layer 1 (legacy): ct-print --json — substring presence checks.
+    // Kept as a safety net so a regression in the textual rendering
+    // is caught even if --full's JSON shape evolves.
+    // -----------------------------------------------------------------
     let output = Command::new(&ct_print)
         .args(["--json"])
         .arg(&ct_path)
@@ -248,19 +259,22 @@ fn test_recorded_trace_via_ct_print_json() {
 
     assert!(
         output.status.success(),
-        "ct-print should succeed; stderr: {}",
+        "ct-print --json should succeed; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!stdout.is_empty(), "ct-print --json produced empty output");
+    let stdout_json = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout_json.is_empty(),
+        "ct-print --json produced empty output"
+    );
 
     // Structural anchor 1: the fixture source path name appears in the
     // path stream rendered by ct-print.
     assert!(
-        stdout.contains("flow_test.leo"),
+        stdout_json.contains("flow_test.leo"),
         "ct-print --json output should mention the fixture source path \
-         (flow_test.leo); got:\n{stdout}"
+         (flow_test.leo); got:\n{stdout_json}"
     );
 
     // Structural anchor 2: at least one of the Leo source-level
@@ -268,13 +282,169 @@ fn test_recorded_trace_via_ct_print_json() {
     // `a` / `b` / `sum_val` / `doubled` / `final_result`.
     let variable_anchor = ["a", "b", "sum_val", "doubled", "final_result"]
         .iter()
-        .any(|v| stdout.contains(v));
+        .any(|v| stdout_json.contains(v));
     assert!(
         variable_anchor,
         "ct-print --json output should mention at least one of the \
          Leo source variable names (a/b/sum_val/doubled/final_result); \
-         got:\n{stdout}"
+         got:\n{stdout_json}"
     );
+
+    // Note: unlike the cairo precedent, the leo recorder's `ct-print
+    // --json` output does *not* surface the integer payloads (only
+    // varnames + step/call structure).  Exact-value assertions live in
+    // Layer 2 below (`ct-print --full`), which is the whole point of
+    // this upgrade.
+
+    // -----------------------------------------------------------------
+    // Layer 2 (the upgrade): ct-print --full — exact decoded values.
+    // -----------------------------------------------------------------
+    let full_output = Command::new(&ct_print)
+        .args(["--full", "--strip-paths"])
+        .arg(&ct_path)
+        .output()
+        .expect("failed to run ct-print --full");
+
+    assert!(
+        full_output.status.success(),
+        "ct-print --full should succeed; stderr: {}",
+        String::from_utf8_lossy(&full_output.stderr)
+    );
+
+    let doc: serde_json::Value = serde_json::from_slice(&full_output.stdout)
+        .expect("ct-print --full should emit valid JSON");
+
+    // ----- Function table: compute and main must both appear ---------
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        functions.iter().any(|f| f.ends_with("compute")),
+        "expected `compute` in functions table; got {:?}",
+        functions
+    );
+    assert!(
+        functions.iter().any(|f| f.ends_with("main")),
+        "expected `main` in functions table; got {:?}",
+        functions
+    );
+
+    // ----- Path table: the canonical fixture path must appear ---------
+    let paths: Vec<&str> = doc["paths"]
+        .as_array()
+        .expect("paths array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        paths.iter().any(|p| p.ends_with("flow_test.leo")),
+        "expected flow_test.leo in paths table; got {:?}",
+        paths
+    );
+
+    // ----- Step / call counts ----------------------------------------
+    // The Leo recorder, after compiling Leo to Aleo and running the Aleo
+    // program, surfaces 8 step events for the canonical fixture: one
+    // synthetic top-level step on line 1, then `compute` walks lines
+    // 12 -> 3 -> 4 -> 5 -> 6 -> 7 (six steps), then a final step on
+    // line 8 outside the call.  Only `compute` is actually traced as a
+    // call (call_entry/call_exit pair) — `main` appears in the function
+    // table but is not invoked as a recorded call here, the recorder
+    // returns the compute result directly.  These are stable properties
+    // of the canonical fixture; if they change, that's a real regression
+    // to investigate, not a flake.
+    let counts = &doc["counts"];
+    assert_eq!(
+        counts["steps"].as_u64(),
+        Some(8),
+        "expected 8 step events for flow_test.leo; counts={counts}",
+    );
+    assert_eq!(
+        counts["calls"].as_u64(),
+        Some(1),
+        "expected 1 call event (compute); counts={counts}",
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+
+    // ----- Call sequence: compute is the only recorded call -----------
+    let call_sequence: Vec<&str> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_entry")
+        .filter_map(|e| e["function"].as_str())
+        .collect();
+    assert_eq!(
+        call_sequence.len(),
+        1,
+        "expected exactly 1 call_entry event; got {:?}",
+        call_sequence
+    );
+    assert!(
+        call_sequence[0].ends_with("compute"),
+        "expected the recorded call to be `compute`; got {:?}",
+        call_sequence
+    );
+
+    // ----- Exact decoded variable values ------------------------------
+    // Collect every (varname, i64) pair surfaced by step events.  These
+    // come from the recorder writing `ValueRecord::Int` CBOR blobs, then
+    // ct-print --full decoding them back to `{"kind":"Int","i":<n>,...}`.
+    let observed_vars: Vec<(String, i64)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .filter_map(|v| {
+            let name = v["varname"].as_str()?.to_string();
+            let value = &v["value"];
+            // The leo recorder encodes u32 register values as
+            // ValueRecord::Int.  If something else surfaces (e.g. BigInt
+            // for wider Aleo numeric types), fail loudly so the test
+            // author can decide whether to extend the assertions or
+            // accept the new variant.
+            assert_eq!(
+                value["kind"].as_str(),
+                Some("Int"),
+                "variable `{}` should decode as Int, got {}; \
+                 if a new ValueRecord variant has landed for leo numeric \
+                 registers, extend this test to assert on it explicitly \
+                 rather than weakening the check",
+                name,
+                value
+            );
+            let i = value["i"]
+                .as_i64()
+                .unwrap_or_else(|| panic!("Int.i must be i64 for `{name}`; got {value}"));
+            Some((name, i))
+        })
+        .collect();
+
+    // The canonical flow: a=10, b=32, sum_val=a+b=42, doubled=sum_val*2=84,
+    // final_result=doubled+a=94.
+    let expected: &[(&str, i64)] = &[
+        ("a", 10),
+        ("b", 32),
+        ("sum_val", 42),
+        ("doubled", 84),
+        ("final_result", 94),
+    ];
+    for (name, value) in expected {
+        assert!(
+            observed_vars
+                .iter()
+                .any(|(n, v)| n == name && v == value),
+            "expected step variable `{name}` = {value} in --full output; \
+             observed = {observed_vars:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
