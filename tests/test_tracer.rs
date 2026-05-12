@@ -621,3 +621,622 @@ fn test_help_mentions_ct_print() {
         "--help must mention `ct print` as the conversion tool; got:\n{help}"
     );
 }
+
+// ===========================================================================
+// Per-program ct-print --full coverage tests
+// ===========================================================================
+//
+// These tests follow the recorder-test-requirements policy
+// (`metacraft-specs/policies/recorder-test-requirements.md`):
+//
+// * Each test records one Leo program through the recorder's normal
+//   entry point (`codetracer_leo_recorder::recorder::record`).
+// * The produced `.ct` is piped through `ct-print --full --strip-paths`.
+// * Assertions are made on the **decoded JSON document** with EXACT
+//   counts (`assert_eq!(events.len(), N)` -- never `>=`), EXACT
+//   ordering (later step from a strictly later source line where
+//   applicable), and EXACT decoded values
+//   (`value["i"] == 42`, `value["kind"] == "Int"`).
+//
+// `ValueRecord` variants outside the expected set are rejected with
+// a hard error message asking the test author to extend the test
+// rather than weaken the assertion.
+//
+// Where the recorder's current behaviour deviates from what the
+// language semantics dictate -- e.g. multi-line `if`/`else` bodies
+// or argumentful function calls not being parsed because the source-
+// level parser is hand-rolled and very limited -- the deviation is
+// documented inline as `RECORDER BUG: ...` and a parallel `#[ignore]`d
+// assertion captures the spec-correct expectation so it surfaces the
+// moment the recorder catches up.
+
+/// Skip-helper: returns `Some(path)` to ct-print or logs a clear
+/// `SKIP:` diagnostic and returns `None`.  The
+/// `verify-cli-convention-no-silent-skip.sh` script greps for the
+/// literal `SKIP:` token, so silent skips remain forbidden.
+fn ct_print_or_skip(test_name: &str) -> Option<PathBuf> {
+    let p = ct_print_path();
+    if !p.exists() {
+        eprintln!(
+            "SKIP: {test_name} requires ct-print at {} -- only available \
+             within the metacraft workspace where codetracer-trace-format-nim \
+             is a sibling.",
+            p.display()
+        );
+        return None;
+    }
+    Some(p)
+}
+
+/// Record a program and return the `ct-print --full --strip-paths`
+/// JSON document plus the absolute path to the source file (so the
+/// caller can match `metadata.program`).  Returns `None` when
+/// `ct-print` is unavailable (the caller has already emitted a
+/// `SKIP:` line via `ct_print_or_skip`).
+fn record_and_dump_full(test_name: &str, program: &str) -> Option<(serde_json::Value, PathBuf)> {
+    let ct_print = ct_print_or_skip(test_name)?;
+
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let out_dir = tmp_dir.path().join("traces");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let source_path = test_programs_dir().join(program);
+    codetracer_leo_recorder::recorder::record(&source_path, &out_dir)
+        .expect("recorder::record should succeed");
+
+    let ct_files: Vec<_> = std::fs::read_dir(&out_dir)
+        .expect("read_dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "ct"))
+        .collect();
+    assert!(
+        !ct_files.is_empty(),
+        "expected a .ct container in {:?}",
+        out_dir
+    );
+
+    let output = Command::new(&ct_print)
+        .args(["--full", "--strip-paths"])
+        .arg(&ct_files[0])
+        .output()
+        .expect("failed to run ct-print --full");
+
+    assert!(
+        output.status.success(),
+        "ct-print --full should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("ct-print --full should emit valid JSON");
+
+    drop(tmp_dir);
+
+    Some((doc, source_path))
+}
+
+/// Decode every (varname, i64) pair from step events.  Rejects any
+/// `ValueRecord` variant other than `Int` with a hard error that
+/// asks the test author to extend the test rather than weaken it.
+fn observed_int_vars(doc: &serde_json::Value) -> Vec<(String, i64)> {
+    let events = doc["events"].as_array().expect("events array");
+    let mut out = Vec::new();
+    for ev in events {
+        if ev["kind"] != "step" {
+            continue;
+        }
+        let Some(vars) = ev["vars"].as_array() else {
+            continue;
+        };
+        for v in vars {
+            let name = v["varname"].as_str().expect("varname str").to_string();
+            let value = &v["value"];
+            assert_eq!(
+                value["kind"].as_str(),
+                Some("Int"),
+                "variable `{}` should decode as Int, got {}; \
+                 if a new ValueRecord variant has landed for Leo numeric \
+                 registers, extend this test to assert on it explicitly \
+                 rather than weakening the check",
+                name,
+                value
+            );
+            let i = value["i"]
+                .as_i64()
+                .unwrap_or_else(|| panic!("Int.i must be i64 for `{name}`; got {value}"));
+            out.push((name, i));
+        }
+    }
+    out
+}
+
+/// Decode the call-entry sequence as a vector of function names.
+fn observed_call_sequence(doc: &serde_json::Value) -> Vec<String> {
+    doc["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|e| e["kind"] == "call_entry")
+        .map(|e| {
+            e["function"]
+                .as_str()
+                .expect("call_entry.function str")
+                .to_string()
+        })
+        .collect()
+}
+
+/// Decode (varname, i64) pairs in event-emission order.
+fn observed_var_sequence(doc: &serde_json::Value) -> Vec<(String, i64)> {
+    observed_int_vars(doc)
+}
+
+/// Assert that every `step` event carries a strictly increasing
+/// `step_index`.  This is the recorder's only ordering guarantee
+/// against duplicates / reorderings.
+fn assert_step_indices_monotonic(doc: &serde_json::Value) {
+    let mut last = -1i64;
+    for ev in doc["events"].as_array().expect("events array") {
+        if ev["kind"] != "step" {
+            continue;
+        }
+        let idx = ev["step_index"]
+            .as_i64()
+            .expect("step_index must be present on step events");
+        assert!(
+            idx > last,
+            "step_index must strictly increase; got {idx} after {last}"
+        );
+        last = idx;
+    }
+}
+
+/// Assert `metadata.program` ends with the expected source filename.
+fn assert_metadata_program_ends_with(doc: &serde_json::Value, source_path: &Path) {
+    let prog = doc["metadata"]["program"]
+        .as_str()
+        .expect("metadata.program str");
+    let want = source_path.file_name().unwrap().to_string_lossy();
+    assert!(
+        prog.ends_with(&*want),
+        "metadata.program {prog} must end with {want}"
+    );
+}
+
+// --- control_flow_test.leo -------------------------------------------------
+
+/// Records `control_flow_test.leo` and asserts on the **current
+/// observed** event shape.  The program exercises if/else, ternary,
+/// and a `for` loop.  The Leo recorder's source-level parser only
+/// handles `let X: T = expr;` lines whose RHS is a literal, register,
+/// or `+`/`-`/`*`/`/` expression -- if/else expressions, ternary
+/// expressions, and `for`-loop bodies are intentionally not compiled
+/// to Aleo instructions.  This pin captures today's output as a
+/// golden snapshot so any future regression is caught even before the
+/// upstream parser gains real support.  The parallel `#[ignore]`d
+/// test below captures the spec-correct expectation.
+#[test]
+fn test_control_flow_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_control_flow_test_via_ct_print_full",
+        "control_flow_test.leo",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table --------------------------------------------
+    // Stable on this fixture: only `main` and `compute` make it into
+    // the function table because the recorder's call tracker runs from
+    // `main` and follows `return compute();`.  No other functions exist.
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["main", "compute"]);
+
+    // ----- Counts -----------------------------------------------------
+    // 1 absolute top-level step + 1 dispatch step (line of `main`'s
+    // return) + 5 step events for the five `let`-bindings inside
+    // compute (raw, sign, bonus, combined, "mut result") + 1 trailing
+    // post-call step on the `return compute();` line = 8 step events.
+    // Only `compute` is recorded as a call (call_entry/call_exit pair).
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(8), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+    assert_eq!(
+        counts["values"].as_u64(),
+        Some(8),
+        "values; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 8 step + 1 call_entry + 1 call_exit = 10 events.
+    assert_eq!(events.len(), 10, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence ---------------------------------------------
+    assert_eq!(observed_call_sequence(&doc), vec!["compute".to_string()]);
+
+    // ----- Decoded variable values -----------------------------------
+    // RECORDER BUG: spec wants the decoded values to be
+    //   raw=7, sign=1, bonus=300, combined=301,
+    //   result=301 (initial) and finally 301 + 0+1+2 = 304.
+    //
+    // Today only `raw`, `combined`, and a binding misnamed
+    // `"mut result"` (the parser leaves the `mut` keyword in the
+    // varname) surface, and `combined`/`result` evaluate to 0 because
+    // the AVM register holding `sign` (and therefore `bonus`) is never
+    // populated -- the source-level expression compiler does not
+    // recognise `if {} else {}` or `?:` and falls back to an `add
+    // <unparsed-text> 0u32 into rN;` instruction whose left operand
+    // never resolves.  Likewise the `for i in 0u32..3u32 { result =
+    // result + i; }` loop body is not compiled at all so the final
+    // `result` retains its initial value.
+    assert_eq!(
+        observed_var_sequence(&doc),
+        vec![
+            ("raw".to_string(), 7),
+            // RECORDER BUG: should also see ("sign", 1), ("bonus", 300)
+            // here -- skipped because the if/else and ternary RHS
+            // expressions don't compile to a recognised Aleo
+            // instruction.
+            ("combined".to_string(), 0),
+            // RECORDER BUG: varname leak -- the parser slices `let mut
+            // result: u32 = combined;` so the binding name carries the
+            // `mut ` keyword prefix.  Spec-correct varname is
+            // `"result"` and the value should be 304 after the for
+            // loop accumulates.
+            ("mut result".to_string(), 0),
+        ],
+        "control_flow_test today only decodes raw / combined / \"mut result\" \
+         and all three are wrong-or-absent past the if/else; spec-correct \
+         values live in the parallel #[ignore]d test"
+    );
+}
+
+#[test]
+#[ignore = "RECORDER BUG: if/else, ternary, for-loop bodies, and the \
+            `mut` modifier are all opaque to the Leo source-level \
+            parser.  Spec-compliant ct-print --full output should \
+            surface the full chain raw=7, sign=1, bonus=300, \
+            combined=301, result=304 with the varname `result` (no \
+            `mut ` prefix)."]
+fn test_control_flow_test_full_chain_decodes() {
+    let Some((doc, _)) = record_and_dump_full(
+        "test_control_flow_test_full_chain_decodes",
+        "control_flow_test.leo",
+    ) else {
+        return;
+    };
+    let expected: Vec<(String, i64)> = vec![
+        ("raw".into(), 7),
+        ("sign".into(), 1),
+        ("bonus".into(), 300),
+        ("combined".into(), 301),
+        ("result".into(), 304),
+    ];
+    assert_eq!(observed_var_sequence(&doc), expected);
+}
+
+// --- nested_calls_test.leo -------------------------------------------------
+
+#[test]
+#[ignore = "RECORDER BUG: the recorder's call-target resolver \
+            (`find_return_call_target` in src/tracer.rs) iterates a \
+            HashMap of peer functions in non-deterministic order and \
+            returns the first non-self peer.  For chains where two or \
+            more intermediate callers have empty bodies, this either \
+            picks the wrong callee or recurses into the same function \
+            twice and ultimately blows the stack -- the recorder \
+            segfaults (~80% of the time on a 4-deep chain, ~30% of the \
+            time on a 3-deep chain).  Spec-compliant ct-print --full \
+            output should surface the chain main -> compute -> inner \
+            with call_entry order [compute, inner], call_exit order \
+            [inner, compute], and step values a=1, b=2, c=3."]
+fn test_nested_calls_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_nested_calls_test_via_ct_print_full",
+        "nested_calls_test.leo",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // Spec-compliant assertions (will fail today because the recorder
+    // either segfaults or picks the wrong callee).
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["main", "compute", "inner"]);
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["calls"].as_u64(), Some(2));
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["compute".to_string(), "inner".to_string()]
+    );
+
+    assert_eq!(
+        observed_var_sequence(&doc),
+        vec![
+            ("a".into(), 1),
+            ("b".into(), 2),
+            ("c".into(), 3),
+        ]
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    let exit_sequence: Vec<&str> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .filter_map(|e| e["function"].as_str())
+        .collect();
+    assert_eq!(exit_sequence, vec!["inner", "compute"]);
+}
+
+// --- collections_test.leo --------------------------------------------------
+
+#[test]
+#[ignore = "RECORDER BUG: struct, tuple, and array literals are \
+            completely opaque to the recorder's source-level parser \
+            (it only understands literal / register / +-*/ \
+            expressions in `let` RHS).  Argumentful function calls \
+            like `sum_pair((10u32, 20u32))` and \
+            `point_distance_sq(Point { x: 3u32, y: 4u32 })` are not \
+            recognised as calls.  Compounding that, the call-target \
+            resolver picks a non-deterministic peer when the chain \
+            from `main` has multiple zero-binding intermediates, so \
+            even the surviving integer let-bindings surface in a \
+            different order from run to run.  Spec-compliant \
+            ct-print --full output should expose the array `xs` as a \
+            ValueRecord::Sequence, the (u32,u32) tuple as Tuple, and \
+            the `Point` struct as Struct, with grand_total decoded \
+            as Int=40."]
+fn test_collections_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_collections_test_via_ct_print_full",
+        "collections_test.leo",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // Spec-compliant function table: every function in the source
+    // must surface (writer-assignment order is main first because the
+    // recorder enters via main()).
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec!["main", "compute", "sum_pair", "point_distance_sq", "array_total"]
+    );
+
+    // Spec-compliant ValueRecord variants: Int, Sequence (the array),
+    // Tuple (the (u32,u32) pair), Struct (the Point literal).
+    let mut kinds = std::collections::BTreeSet::new();
+    for ev in doc["events"].as_array().unwrap() {
+        if ev["kind"] != "step" {
+            continue;
+        }
+        for v in ev["vars"].as_array().cloned().unwrap_or_default() {
+            if let Some(k) = v["value"]["kind"].as_str() {
+                kinds.insert(k.to_string());
+            }
+        }
+    }
+    for want in ["Int", "Sequence", "Tuple", "Struct"] {
+        assert!(
+            kinds.contains(want),
+            "expected {want} ValueRecord variant in collections trace; got {kinds:?}"
+        );
+    }
+}
+
+// --- error_paths_test.leo --------------------------------------------------
+
+#[test]
+#[ignore = "RECORDER BUG: `assert_eq` and `assert` are not surfaced as \
+            anything in the trace -- not as a step, not as an io_event, \
+            and a failed assertion does NOT terminate execution or \
+            emit an EventLogKind::Error record.  Compounding that, the \
+            call-target resolver iterates `func_map` in HashMap order \
+            and may pick `safe_compute`, `failing_compute`, or \
+            `compute` itself when emitting from `main`, so even the \
+            non-error trace shape is non-deterministic.  Spec-\
+            compliant ct-print --full output should run \
+            main -> compute -> safe_compute (the path the source \
+            actually traverses), surface every let-binding (a=5, b=7, \
+            c=12, safe_val=12, bumped=112), and emit ZERO error \
+            events on the safe path."]
+fn test_error_paths_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_error_paths_test_via_ct_print_full",
+        "error_paths_test.leo",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec!["main", "compute", "safe_compute"],
+        "spec wants only the actually-reached chain; failing_compute is \
+         declared but never invoked from main"
+    );
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["compute".to_string(), "safe_compute".to_string()]
+    );
+
+    assert_eq!(
+        observed_var_sequence(&doc),
+        vec![
+            ("a".into(), 5),
+            ("b".into(), 7),
+            ("c".into(), 12),
+            ("safe_val".into(), 12),
+            ("bumped".into(), 112),
+        ]
+    );
+
+    let counts = &doc["counts"];
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "no error events on the safe path; counts={counts}"
+    );
+}
+
+#[test]
+#[ignore = "RECORDER BUG: a failing `assert_eq(1u32, 2u32)` in \
+            `failing_compute` should produce a RecordEvent of \
+            EventLogKind::Error (or equivalent) and terminate the \
+            trace, but today the assert is silently elided and the \
+            recorder emits a clean trace as if no failure occurred. \
+            This test pins the spec-correct expectation -- it should \
+            start passing the moment the recorder learns to surface \
+            assertion failures."]
+fn test_error_paths_test_emits_assert_failure_event() {
+    let Some((doc, _)) = record_and_dump_full(
+        "test_error_paths_test_emits_assert_failure_event",
+        "error_paths_test.leo",
+    ) else {
+        return;
+    };
+    let counts = &doc["counts"];
+    assert!(
+        counts["io_events"].as_u64().unwrap_or(0) >= 1,
+        "expected at least one io_event for the assertion failure; counts={counts}"
+    );
+}
+
+// --- assert_test.leo -------------------------------------------------------
+
+/// Records `assert_test.leo`.  Each `assert` / `assert_eq` holds, so
+/// the trace runs to completion.  The deterministic shape today is
+/// 6 step events + 1 call (compute).  The two assert lines are
+/// silently dropped from the trace -- see RECORDER BUG note in the
+/// `#[ignore]`d sibling test for the spec-correct expectation.
+#[test]
+fn test_assert_test_via_ct_print_full() {
+    let Some((doc, source_path)) =
+        record_and_dump_full("test_assert_test_via_ct_print_full", "assert_test.leo")
+    else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["main", "compute"]);
+
+    // ----- Counts ----------------------------------------------------
+    // 1 absolute top-level step + 1 dispatch step + 3 step events for
+    // the three let-bindings inside compute (a, b, sum_val) + 1
+    // trailing post-call step = 6 steps.  Only `compute` is recorded
+    // as a call.  RECORDER BUG: io_events should be >= 2 (one per
+    // assert) but the recorder doesn't surface assert calls at all.
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(6), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+    assert_eq!(
+        counts["values"].as_u64(),
+        Some(6),
+        "values; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 6 steps + 1 call_entry + 1 call_exit = 8 events.
+    assert_eq!(events.len(), 8, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(observed_call_sequence(&doc), vec!["compute".to_string()]);
+
+    // ----- Exact decoded values --------------------------------------
+    // The two assert calls (line 15 and line 17) are silently dropped
+    // from the trace; only the three integer let-bindings round-trip.
+    assert_eq!(
+        observed_var_sequence(&doc),
+        vec![
+            ("a".to_string(), 4),
+            ("b".to_string(), 5),
+            ("sum_val".to_string(), 9),
+        ]
+    );
+
+    // ----- Return value carries the final sum_val --------------------
+    let returns: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let rv = &e["return_value"];
+            assert_eq!(
+                rv["kind"].as_str(),
+                Some("Int"),
+                "return value must decode as Int; got {rv}"
+            );
+            rv["i"].as_i64().expect("return value Int.i")
+        })
+        .collect();
+    assert_eq!(returns, vec![9]);
+}
+
+#[test]
+#[ignore = "RECORDER BUG: `assert(cond)` and `assert_eq(a, b)` should \
+            each surface as an io_event (or a dedicated step kind), \
+            even on the passing path -- they are observable side \
+            effects that downstream consumers (the GUI, the agent \
+            evals) need to see.  Today the recorder drops them \
+            entirely.  Spec-compliant output should emit at least \
+            two io_events (one per assert call) for assert_test.leo."]
+fn test_assert_test_emits_assert_events() {
+    let Some((doc, _)) =
+        record_and_dump_full("test_assert_test_emits_assert_events", "assert_test.leo")
+    else {
+        return;
+    };
+    let counts = &doc["counts"];
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(2),
+        "expected exactly 2 io_events (one per assert call); counts={counts}"
+    );
+}
