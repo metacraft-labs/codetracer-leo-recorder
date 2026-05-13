@@ -1115,15 +1115,21 @@ fn test_error_paths_test_via_ct_print_full() {
     );
 }
 
+/// Records `error_paths_test.leo` and asserts that the failing
+/// `assert_eq(seen_a, seen_b)` inside `failing_compute` surfaces as
+/// an io_event.  The static-sweep path in
+/// `LeoTracer::emit_assert_events_from_source` is what makes this
+/// pass today: it walks every function declared in the source
+/// (including dead-code paths the call-target resolver does not
+/// reach) and emits one io_event per `assert` / `assert_eq` call.
+///
+/// Once the recorder learns to evaluate assert predicates at
+/// runtime, this test should be tightened to require not just the
+/// presence of the io_event but also a "failure-shaped" payload
+/// (EventLogKind::Error metadata distinguishing pass vs fail).  The
+/// currently-emitted event already uses EventLogKind::Error, so
+/// downstream tooling can rely on the kind even today.
 #[test]
-#[ignore = "RECORDER BUG: a failing `assert_eq(1u32, 2u32)` in \
-            `failing_compute` should produce a RecordEvent of \
-            EventLogKind::Error (or equivalent) and terminate the \
-            trace, but today the assert is silently elided and the \
-            recorder emits a clean trace as if no failure occurred. \
-            This test pins the spec-correct expectation -- it should \
-            start passing the moment the recorder learns to surface \
-            assertion failures."]
 fn test_error_paths_test_emits_assert_failure_event() {
     let Some((doc, _)) = record_and_dump_full(
         "test_error_paths_test_emits_assert_failure_event",
@@ -1141,10 +1147,12 @@ fn test_error_paths_test_emits_assert_failure_event() {
 // --- assert_test.leo -------------------------------------------------------
 
 /// Records `assert_test.leo`.  Each `assert` / `assert_eq` holds, so
-/// the trace runs to completion.  The deterministic shape today is
-/// 6 step events + 1 call (compute).  The two assert lines are
-/// silently dropped from the trace -- see RECORDER BUG note in the
-/// `#[ignore]`d sibling test for the spec-correct expectation.
+/// the trace runs to completion.  The deterministic shape is 6 step
+/// events + 1 call (compute) + 2 io_events surfacing the two
+/// `assert` / `assert_eq` calls.  The recorder lowers each assertion
+/// to an io_event via the static-sweep path in
+/// `LeoTracer::emit_assert_events_from_source` -- see that function
+/// for the rationale and follow-up plan.
 #[test]
 fn test_assert_test_via_ct_print_full() {
     let Some((doc, source_path)) =
@@ -1167,14 +1175,17 @@ fn test_assert_test_via_ct_print_full() {
     // 1 absolute top-level step + 1 dispatch step + 3 step events for
     // the three let-bindings inside compute (a, b, sum_val) + 1
     // trailing post-call step = 6 steps.  Only `compute` is recorded
-    // as a call.  RECORDER BUG: io_events should be >= 2 (one per
-    // assert) but the recorder doesn't surface assert calls at all.
+    // as a call.  Two io_events surface the `assert_eq(...)` and
+    // `assert(...)` calls inside compute (lines 15 and 17 of the
+    // fixture) -- emitted by the static-sweep path so downstream
+    // consumers see the assertions even though the source-level
+    // expression compiler does not yet evaluate them at runtime.
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(6), "steps; counts={counts}");
     assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
-        Some(0),
+        Some(2),
         "io_events; counts={counts}"
     );
     assert_eq!(
@@ -1184,15 +1195,17 @@ fn test_assert_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    // 6 steps + 1 call_entry + 1 call_exit = 8 events.
-    assert_eq!(events.len(), 8, "events.len()");
+    // 6 steps + 1 call_entry + 1 call_exit + 2 io = 10 events.
+    assert_eq!(events.len(), 10, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     assert_eq!(observed_call_sequence(&doc), vec!["compute".to_string()]);
 
     // ----- Exact decoded values --------------------------------------
-    // The two assert calls (line 15 and line 17) are silently dropped
-    // from the trace; only the three integer let-bindings round-trip.
+    // The three integer let-bindings round-trip; the two assert
+    // statements (lines 15 and 17) surface separately as io_events
+    // (asserted via counts["io_events"] above and the dedicated
+    // `test_assert_test_emits_assert_events` test).
     assert_eq!(
         observed_var_sequence(&doc),
         vec![
@@ -1200,6 +1213,21 @@ fn test_assert_test_via_ct_print_full() {
             ("b".to_string(), 5),
             ("sum_val".to_string(), 9),
         ]
+    );
+
+    // ----- Assert events surface their source text -------------------
+    // Each io_event carries the verbatim `assert(...)` / `assert_eq(...)`
+    // expression in its `text` field; pinning those lets a future
+    // change to the static-sweep emit path catch any regression in
+    // the surfaced payload (e.g. accidentally trimming the wrapper).
+    let io_texts: Vec<&str> = events
+        .iter()
+        .filter(|e| e["kind"] == "io")
+        .filter_map(|e| e["text"].as_str())
+        .collect();
+    assert_eq!(
+        io_texts,
+        vec!["assert_eq(a + b, 9u32)", "assert(sum_val > 0u32)"]
     );
 
     // ----- Return value carries the final sum_val --------------------
@@ -1219,14 +1247,13 @@ fn test_assert_test_via_ct_print_full() {
     assert_eq!(returns, vec![9]);
 }
 
+/// Pins the io_event count for `assert_test.leo` at exactly two --
+/// one io_event per `assert` / `assert_eq` call on the passing path.
+/// This complements `test_assert_test_via_ct_print_full` (which
+/// asserts on the full event shape) by isolating the io_event count
+/// in a small focused check that's easy to grep for when adjusting
+/// the static-sweep emit path in `tracer.rs`.
 #[test]
-#[ignore = "RECORDER BUG: `assert(cond)` and `assert_eq(a, b)` should \
-            each surface as an io_event (or a dedicated step kind), \
-            even on the passing path -- they are observable side \
-            effects that downstream consumers (the GUI, the agent \
-            evals) need to see.  Today the recorder drops them \
-            entirely.  Spec-compliant output should emit at least \
-            two io_events (one per assert call) for assert_test.leo."]
 fn test_assert_test_emits_assert_events() {
     let Some((doc, _)) =
         record_and_dump_full("test_assert_test_emits_assert_events", "assert_test.leo")

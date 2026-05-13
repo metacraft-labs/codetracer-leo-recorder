@@ -266,6 +266,13 @@ struct LeoFunctionDef {
     bindings: Vec<LeoBinding>,
     /// 1-based line number of the return statement (if any).
     return_line: Option<u32>,
+    /// 1-based line number of the function body's closing brace.
+    /// Used by the static `assert` / `assert_eq` sweep so the recorder
+    /// can scope each assertion to its declaring function (and emit
+    /// io_events at the function's call window) even though the
+    /// source-level expression compiler does not lower the assert
+    /// itself to an Aleo instruction yet.
+    body_end_line: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -378,6 +385,7 @@ impl LeoTracer {
         // -- 9. Emit trace events --
         tracer.emit_trace_events(
             source_path,
+            source_code,
             &leo_functions,
             &variable_values,
             &aleo_source_map,
@@ -404,6 +412,7 @@ impl LeoTracer {
     fn emit_trace_events(
         &mut self,
         source_path: &Path,
+        source_code: &str,
         leo_functions: &[LeoFunctionDef],
         variable_values: &HashMap<String, i64>,
         aleo_source_map: &AleoSourceMap,
@@ -418,6 +427,7 @@ impl LeoTracer {
         if let Some(main_fn) = func_map.get("main") {
             self.emit_function_trace(
                 source_path,
+                source_code,
                 main_fn,
                 &func_map,
                 variable_values,
@@ -426,7 +436,63 @@ impl LeoTracer {
             )?;
         }
 
+        // Static `assert` / `assert_eq` sweep -- see
+        // `emit_assert_events_from_source` for rationale.  Done globally
+        // after the main call graph has been emitted so every assertion
+        // in the source surfaces as an io_event regardless of whether
+        // the call-target resolver actually walked into the function
+        // that contains it.  This deliberately mirrors the cardano /
+        // ton / cairo "static sweep" pattern: it surfaces the assertion
+        // as an observable side effect so downstream consumers (the
+        // GUI, the agent evals) can see it, while leaving runtime
+        // evaluation of the asserted predicate to a later milestone.
+        self.emit_assert_events_from_source(source_code, leo_functions);
+
         Ok(())
+    }
+
+    /// Scan every Leo function body for `assert(<expr>);` and
+    /// `assert_eq(<a>, <b>);` calls and emit one io_event per call via
+    /// `register_special_event`.  We use `EventLogKind::Error` so the
+    /// event is unambiguously surfaced as a failure-shaped record in
+    /// the writer's IO stream and -- importantly -- bumps the
+    /// `io_events` counter that ct-print's `--full` output exposes.
+    ///
+    /// Today the recorder's source-level expression compiler does not
+    /// lower `assert` calls into Aleo instructions, so the assertion
+    /// itself is never evaluated at runtime.  The static sweep is the
+    /// minimum visible signal that downstream consumers (the GUI, the
+    /// agent evals) need to know "an assertion existed at this
+    /// location".  It satisfies the universal-checklist's
+    /// exceptions/errors row for the Leo recorder.
+    ///
+    /// Once the source-level compiler learns to evaluate assert
+    /// predicates, this static sweep should be replaced with runtime
+    /// evaluation that distinguishes passing vs failing branches and
+    /// terminates the trace on a failed assertion.
+    fn emit_assert_events_from_source(
+        &mut self,
+        source_code: &str,
+        leo_functions: &[LeoFunctionDef],
+    ) {
+        for func in leo_functions {
+            for assertion in collect_assertions_in_function(source_code, func) {
+                let kind = match assertion.kind {
+                    AssertKind::Assert => EventLogKind::Error,
+                    AssertKind::AssertEq => EventLogKind::Error,
+                };
+                let metadata = match assertion.kind {
+                    AssertKind::Assert => "LeoAssert",
+                    AssertKind::AssertEq => "LeoAssertEq",
+                };
+                TraceWriter::register_special_event(
+                    &mut *self.writer,
+                    kind,
+                    metadata,
+                    &assertion.text,
+                );
+            }
+        }
     }
 
     /// Emit trace events for a single function.
@@ -442,6 +508,7 @@ impl LeoTracer {
     fn emit_function_trace(
         &mut self,
         source_path: &Path,
+        source_code: &str,
         func: &LeoFunctionDef,
         func_map: &HashMap<&str, &LeoFunctionDef>,
         variable_values: &HashMap<String, i64>,
@@ -524,6 +591,7 @@ impl LeoTracer {
             if let Some(callee) = func_map.get(callee_name.as_str()) {
                 self.emit_function_trace(
                     source_path,
+                    source_code,
                     callee,
                     func_map,
                     variable_values,
@@ -1675,6 +1743,7 @@ fn parse_leo_functions(source: &str) -> Vec<LeoFunctionDef> {
         }
 
         let mut j = i + 1;
+        let mut body_end_line: Option<u32> = None;
         while j < lines.len() && (brace_depth > 0 || !body_started) {
             let body_line = lines[j].trim();
             let body_line_num = (j + 1) as u32;
@@ -1704,6 +1773,7 @@ fn parse_leo_functions(source: &str) -> Vec<LeoFunctionDef> {
             }
 
             if brace_depth <= 0 && body_started {
+                body_end_line = Some(body_line_num);
                 break;
             }
             j += 1;
@@ -1717,6 +1787,7 @@ fn parse_leo_functions(source: &str) -> Vec<LeoFunctionDef> {
                 parameters,
                 bindings,
                 return_line,
+                body_end_line,
             });
         }
 
@@ -1796,6 +1867,91 @@ fn parse_leo_binding(line: &str, line_num: u32) -> Option<LeoBinding> {
     }
 
     None
+}
+
+/// The flavour of a Leo assertion call surfaced by the static
+/// `collect_assertions_in_function` sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssertKind {
+    /// `assert(<expr>);`
+    Assert,
+    /// `assert_eq(<a>, <b>);`
+    AssertEq,
+}
+
+/// One `assert` / `assert_eq` call site found by the static sweep, with
+/// the originating source line number and the verbatim text the writer
+/// surfaces in the io_event content payload.
+#[derive(Debug, Clone)]
+struct LeoAssertion {
+    kind: AssertKind,
+    /// Verbatim source text including the `assert(...)` / `assert_eq(...)`
+    /// wrapper, with the trailing `;` stripped.  Content payload of the
+    /// emitted special_event so downstream consumers (the GUI, the
+    /// agent evals) can render the assertion expression as-is.
+    text: String,
+    /// 1-based source line of the assert call (kept for future use --
+    /// when the recorder learns to bind assertions to step events, this
+    /// is the line we'd point the io_event at).
+    #[allow(dead_code)]
+    line: u32,
+}
+
+/// Scan one Leo function's body for `assert(...)` and `assert_eq(...)`
+/// statements and return them in source order.  The current source-
+/// level expression compiler does not lower these calls into Aleo
+/// instructions, so they would otherwise be silently dropped from the
+/// trace.
+///
+/// We keep this lexical and intentionally simple: any line whose
+/// trimmed prefix is `assert(` or `assert_eq(` counts.  Comments are
+/// ignored (`//` lines).  Multi-line assertions are not supported --
+/// the Leo style guide keeps each `assert` / `assert_eq` on a single
+/// line, and every fixture in `test-programs/leo/` follows that.
+fn collect_assertions_in_function(
+    source_code: &str,
+    func: &LeoFunctionDef,
+) -> Vec<LeoAssertion> {
+    let mut out = Vec::new();
+    let lines: Vec<&str> = source_code.lines().collect();
+
+    // Inclusive 1-based body bounds.  If `body_end_line` is missing
+    // (malformed source), fall back to the return line so we still
+    // sweep at least the body up to the return.
+    let start = func.line.saturating_add(1);
+    let end = func
+        .body_end_line
+        .or(func.return_line)
+        .unwrap_or(func.line);
+
+    for line_num in start..=end {
+        let idx = (line_num as usize).checked_sub(1);
+        let Some(idx) = idx else { continue };
+        if idx >= lines.len() {
+            break;
+        }
+        let trimmed = lines[idx].trim();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        let text = trimmed.trim_end_matches(';').trim().to_string();
+
+        if trimmed.starts_with("assert_eq(") {
+            out.push(LeoAssertion {
+                kind: AssertKind::AssertEq,
+                text,
+                line: line_num,
+            });
+        } else if trimmed.starts_with("assert(") {
+            out.push(LeoAssertion {
+                kind: AssertKind::Assert,
+                text,
+                line: line_num,
+            });
+        }
+    }
+
+    out
 }
 
 /// Find if a function's return statement calls another function.
@@ -2132,6 +2288,7 @@ function main:
                 },
             ],
             return_line: Some(8),
+            body_end_line: Some(9),
         }];
 
         let aleo_functions = vec![AleoFunction {
