@@ -81,6 +81,15 @@ pub struct AleoSourceMap {
 }
 
 impl AleoSourceMap {
+    /// Return an empty `AleoSourceMap`.  Used when the structured Leo
+    /// evaluator drives emission and the legacy Aleo-to-Leo mapping is
+    /// not consulted.
+    pub fn empty() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
     /// Resolve an Aleo instruction to its originating Leo source location.
     ///
     /// Returns `Some((file, line))` if the instruction has a known Leo source
