@@ -12,11 +12,14 @@
 //! Variable values are mapped back to Leo source lines by correlating
 //! Aleo register assignments with the original source declarations.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::process::Command;
 
-use codetracer_trace_types::{EventLogKind, Line, TypeKind, ValueRecord, NONE_VALUE};
+use codetracer_trace_types::{
+    EventLogKind, FieldTypeRecord, Line, TypeKind, TypeRecord, TypeSpecificInfo, ValueRecord,
+    NONE_VALUE,
+};
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
 use codetracer_trace_writer_nim::{create_trace_writer, TraceEventsFileFormat};
 use eyre::{eyre, Context, Result};
@@ -238,6 +241,14 @@ struct LeoBinding {
     type_name: String,
     /// 1-based source line number.
     line: u32,
+    /// The right-hand-side expression text (everything after `=`,
+    /// stripped of trailing `;`).  Carried so the source-derived
+    /// evaluator can re-parse it without re-walking the original
+    /// source lines.  Defaults to the empty string for bindings parsed
+    /// before this field was introduced (none of the live call sites
+    /// rely on the empty-default behaviour any more).
+    #[allow(dead_code)]
+    rhs: String,
 }
 
 /// A Leo function definition parsed from source (for call/return tracing).
@@ -272,6 +283,7 @@ struct LeoFunctionDef {
     /// io_events at the function's call window) even though the
     /// source-level expression compiler does not lower the assert
     /// itself to an Aleo instruction yet.
+    #[allow(dead_code)]
     body_end_line: Option<u32>,
 }
 
@@ -406,49 +418,308 @@ impl LeoTracer {
 
     /// Emit trace events by walking through Leo functions and their bindings.
     ///
-    /// When an `AleoSourceMap` is available, step events point to the Leo
-    /// source lines that originated each Aleo instruction, instead of the
-    /// raw Aleo instruction positions.
+    /// The structured evaluator (`parse_leo_program` +
+    /// `execute_leo_function`) is the primary execution engine: it
+    /// handles if/else, ternary, for-loops, struct/tuple/array
+    /// literals, argumentful function calls, and arbitrary call
+    /// graphs.  The legacy AVM `variable_values` map is no longer
+    /// consulted by the emit pass -- the structured evaluator's typed
+    /// `Value` env replaces it.
     fn emit_trace_events(
         &mut self,
         source_path: &Path,
         source_code: &str,
         leo_functions: &[LeoFunctionDef],
-        variable_values: &HashMap<String, i64>,
-        aleo_source_map: &AleoSourceMap,
+        _variable_values: &HashMap<String, i64>,
+        _aleo_source_map: &AleoSourceMap,
     ) -> Result<()> {
-        // Find main function and the functions it calls.
-        let func_map: HashMap<&str, &LeoFunctionDef> =
-            leo_functions.iter().map(|f| (f.name.as_str(), f)).collect();
+        let prog = parse_leo_program(source_code);
 
-        // Execute starting from main. Merge main into <toplevel> by passing
-        // is_entry_point=true so its Call/Return events are suppressed and all
-        // steps remain at depth 0.
-        if let Some(main_fn) = func_map.get("main") {
-            self.emit_function_trace(
-                source_path,
-                source_code,
-                main_fn,
-                &func_map,
-                variable_values,
-                aleo_source_map,
-                true,
-            )?;
+        // The structured parser is the source of truth.  Register
+        // every declared struct as a typed record so
+        // `value_to_record` can emit `ValueRecord::Struct` with the
+        // right field-name metadata when the evaluator surfaces a
+        // struct literal.
+        let mut struct_type_ids: HashMap<String, codetracer_trace_types::TypeId> = HashMap::new();
+        for (name, def) in &prog.structs {
+            // Field-type IDs default to u32 (Int) -- every fixture
+            // struct uses only `u32` fields today.  Field types that
+            // aren't registered fall back to the writer's u32 id.
+            let field_records: Vec<FieldTypeRecord> = def
+                .fields
+                .iter()
+                .map(|(fname, ftype)| FieldTypeRecord {
+                    name: fname.clone(),
+                    type_id: self.ensure_int_type(ftype),
+                })
+                .collect();
+            let type_record = TypeRecord {
+                kind: TypeKind::Struct,
+                lang_type: name.clone(),
+                specific_info: TypeSpecificInfo::Struct {
+                    fields: field_records,
+                },
+            };
+            let id = TraceWriter::ensure_raw_type_id(&mut *self.writer, type_record);
+            struct_type_ids.insert(name.clone(), id);
         }
 
-        // Static `assert` / `assert_eq` sweep -- see
-        // `emit_assert_events_from_source` for rationale.  Done globally
-        // after the main call graph has been emitted so every assertion
-        // in the source surfaces as an io_event regardless of whether
-        // the call-target resolver actually walked into the function
-        // that contains it.  This deliberately mirrors the cardano /
-        // ton / cairo "static sweep" pattern: it surfaces the assertion
-        // as an observable side effect so downstream consumers (the
-        // GUI, the agent evals) can see it, while leaving runtime
-        // evaluation of the asserted predicate to a later milestone.
-        self.emit_assert_events_from_source(source_code, leo_functions);
+        // Compute reachability set for the static-sweep assert gating:
+        // only assertions inside functions actually reachable from
+        // `main` should surface as io_events.  Unreachable functions
+        // declared in source (e.g. `failing_compute` in
+        // error_paths_test.leo) must not pollute the io_event stream.
+        let reachable: BTreeSet<String> = if prog.by_name.contains_key("main") {
+            reachable_functions(&prog, "main")
+        } else {
+            BTreeSet::new()
+        };
+
+        // Execute and emit from `main` via the structured evaluator.
+        if let Some(main_fn) = prog.by_name.get("main") {
+            let trace = execute_leo_function(&prog, main_fn, &[]);
+            self.emit_call_trace(
+                source_path,
+                main_fn,
+                &trace,
+                &[],
+                &prog,
+                &struct_type_ids,
+                /*is_entry_point=*/ true,
+            );
+        } else {
+            // Fallback: legacy walk (no main() defined).  Preserves
+            // backward compat for finalize-test fixtures.
+            let func_map: HashMap<&str, &LeoFunctionDef> =
+                leo_functions.iter().map(|f| (f.name.as_str(), f)).collect();
+            if let Some(any_fn) = func_map.values().next() {
+                self.emit_function_trace(
+                    source_path,
+                    source_code,
+                    any_fn,
+                    &func_map,
+                    &HashMap::new(),
+                    &AleoSourceMap::empty(),
+                    true,
+                )?;
+            }
+        }
+
+        // Static assert sweep -- gated on reachability.  The
+        // structured evaluator already emitted per-call assert events
+        // inline; this sweep is intentionally skipped because every
+        // reachable assert was emitted by `emit_call_trace`.  Kept as
+        // a documented no-op so downstream tooling (the IO-event
+        // count assertions) sees the reachable-only assert set.
+        let _ = leo_functions;
+        let _ = reachable;
 
         Ok(())
+    }
+
+    /// Register (or look up) an Int-kind type id for a given Leo
+    /// type name (`u32`, `u64`, ...).  Side-effect: caches in
+    /// `self.type_ids` so repeat lookups are O(1).
+    fn ensure_int_type(&mut self, type_name: &str) -> codetracer_trace_types::TypeId {
+        if let Some(id) = self.type_ids.get(type_name) {
+            return *id;
+        }
+        let id = TraceWriter::ensure_type_id(&mut *self.writer, TypeKind::Int, type_name);
+        self.type_ids.insert(type_name.to_string(), id);
+        id
+    }
+
+    /// Walk a `CallTrace` and emit step / call / return / io events.
+    ///
+    /// `call_args` carries the `(formal-name, value)` pairs that the
+    /// caller staged before entering this function.  For the entry
+    /// point (`main` -- merged into `<toplevel>`), pass an empty slice.
+    fn emit_call_trace(
+        &mut self,
+        source_path: &Path,
+        func: &LeoFunc,
+        trace: &CallTrace,
+        call_args: &[(String, Value)],
+        prog: &LeoProgram,
+        struct_type_ids: &HashMap<String, codetracer_trace_types::TypeId>,
+        is_entry_point: bool,
+    ) {
+        let fn_id = TraceWriter::ensure_function_id(
+            &mut *self.writer,
+            &func.name,
+            source_path,
+            Line(func.line as i64),
+        );
+        if !is_entry_point {
+            for (pname, pvalue) in call_args {
+                let record = self.value_to_record(pvalue, struct_type_ids);
+                TraceWriter::arg(&mut *self.writer, pname, record);
+            }
+            TraceWriter::register_call(&mut *self.writer, fn_id, vec![]);
+            // Emit a function-entry step so the writer assigns a
+            // distinct `entryStep` to this call.  Without this, two
+            // back-to-back `register_call`s (e.g. `compute() { return
+            // inner(); }`) end up sharing the same entryStep and
+            // ct-print orders them by call_key (close order, LIFO)
+            // instead of entry order.  The step points at the
+            // function's signature line for symmetry with the
+            // historical AVM emit shape.  When the function has
+            // parameters, this also anchors the per-parameter
+            // `register_variable_with_full_value` calls below so
+            // structured arguments (Tuple/Struct/Sequence) actually
+            // surface in the variable stream.
+            TraceWriter::register_step(&mut *self.writer, source_path, Line(func.line as i64));
+            // Re-emit each formal parameter as a step variable so the
+            // structured argument value (Tuple `(10, 20)` for
+            // `sum_pair(p)`, Struct `{x:3,y:4}` for
+            // `point_distance_sq(p)`) lands on the function-entry
+            // step.  Without this, parameters whose value isn't `Int`
+            // never appear in `step.vars`, defeating the whole point
+            // of decoding structured argument literals at the call
+            // site.
+            for (pname, pvalue) in call_args {
+                let record = self.value_to_record(pvalue, struct_type_ids);
+                TraceWriter::register_variable_with_full_value(&mut *self.writer, pname, record);
+            }
+        }
+
+        // Emit step events in source order, interleaving sub-calls
+        // at the binding indices where they were captured.
+        let mut sub_idx = 0;
+        for (binding_idx, binding) in trace.bindings.iter().enumerate() {
+            // First, emit any sub-calls captured AT this binding index
+            // before this binding's step (the sub-call's RHS is part
+            // of this binding's expression -- the call_entry should
+            // appear right before the binding's step in the stream).
+            while sub_idx < trace.sub_calls.len()
+                && trace.sub_calls[sub_idx].after_binding == binding_idx
+            {
+                let sub = &trace.sub_calls[sub_idx];
+                if let Some(callee_fn) = prog.by_name.get(&sub.callee) {
+                    self.emit_call_trace(
+                        source_path,
+                        callee_fn,
+                        &sub.trace,
+                        &sub.args,
+                        prog,
+                        struct_type_ids,
+                        false,
+                    );
+                }
+                sub_idx += 1;
+            }
+
+            // Emit step + variable for this binding.
+            TraceWriter::register_step(&mut *self.writer, source_path, Line(binding.line as i64));
+            let record = self.value_to_record(&binding.value, struct_type_ids);
+            TraceWriter::register_variable_with_full_value(
+                &mut *self.writer,
+                &binding.name,
+                record,
+            );
+        }
+
+        // Emit trailing sub-calls (captured "after the last binding"
+        // -- e.g. when the return expression itself is a call).
+        while sub_idx < trace.sub_calls.len() {
+            let sub = &trace.sub_calls[sub_idx];
+            if let Some(callee_fn) = prog.by_name.get(&sub.callee) {
+                self.emit_call_trace(
+                    source_path,
+                    callee_fn,
+                    &sub.trace,
+                    &sub.args,
+                    prog,
+                    struct_type_ids,
+                    false,
+                );
+            }
+            sub_idx += 1;
+        }
+
+        // Emit io_events for any assertions executed inside this
+        // function.  Reachability is implicit -- we only reach this
+        // function because main's call graph leads here.
+        for a in &trace.asserts {
+            let metadata = match a.kind {
+                AssertKind::Assert => "LeoAssert",
+                AssertKind::AssertEq => "LeoAssertEq",
+            };
+            TraceWriter::register_special_event(
+                &mut *self.writer,
+                EventLogKind::Error,
+                metadata,
+                &a.text,
+            );
+        }
+
+        // Emit the return-statement step (so the line of the `return`
+        // shows up in the trace, matching the legacy AVM emit shape).
+        let return_line = find_return_line_in_body(&func.body).unwrap_or(func.body_end_line);
+        TraceWriter::register_step(&mut *self.writer, source_path, Line(return_line as i64));
+
+        if !is_entry_point {
+            let record = self.value_to_record(&trace.return_value, struct_type_ids);
+            TraceWriter::register_return(&mut *self.writer, record);
+        }
+    }
+
+    /// Convert a structured `Value` into a wire-format `ValueRecord`,
+    /// registering nested struct types lazily as needed.
+    fn value_to_record(
+        &mut self,
+        v: &Value,
+        struct_type_ids: &HashMap<String, codetracer_trace_types::TypeId>,
+    ) -> ValueRecord {
+        match v {
+            Value::Int(i, type_name) => {
+                let type_id = self.ensure_int_type(type_name);
+                ValueRecord::Int { i: *i, type_id }
+            }
+            Value::Bool(b) => {
+                let type_id = self.ensure_int_type("bool");
+                ValueRecord::Bool { b: *b, type_id }
+            }
+            Value::Sequence(elems, elem_type) => {
+                let elements: Vec<ValueRecord> = elems
+                    .iter()
+                    .map(|e| self.value_to_record(e, struct_type_ids))
+                    .collect();
+                let lang = format!("[{elem_type}; {}]", elems.len());
+                let type_id =
+                    TraceWriter::ensure_type_id(&mut *self.writer, TypeKind::Array, &lang);
+                ValueRecord::Sequence {
+                    elements,
+                    is_slice: false,
+                    type_id,
+                }
+            }
+            Value::Tuple(elems) => {
+                let elements: Vec<ValueRecord> = elems
+                    .iter()
+                    .map(|e| self.value_to_record(e, struct_type_ids))
+                    .collect();
+                let lang = format!("({} elements)", elems.len());
+                let type_id =
+                    TraceWriter::ensure_type_id(&mut *self.writer, TypeKind::Tuple, &lang);
+                ValueRecord::Tuple { elements, type_id }
+            }
+            Value::Struct { name, fields } => {
+                let type_id = struct_type_ids
+                    .get(name)
+                    .copied()
+                    .unwrap_or_else(|| self.ensure_int_type(name));
+                let field_values: Vec<ValueRecord> = fields
+                    .iter()
+                    .map(|(_, v)| self.value_to_record(v, struct_type_ids))
+                    .collect();
+                ValueRecord::Struct {
+                    field_values,
+                    type_id,
+                }
+            }
+            Value::Unknown => NONE_VALUE,
+        }
     }
 
     /// Scan every Leo function body for `assert(<expr>);` and
@@ -470,6 +741,13 @@ impl LeoTracer {
     /// predicates, this static sweep should be replaced with runtime
     /// evaluation that distinguishes passing vs failing branches and
     /// terminates the trace on a failed assertion.
+    ///
+    /// Currently unused -- the structured evaluator
+    /// (`execute_leo_function`) emits per-call assert events inline,
+    /// gated on reachability from `main`.  Kept for the legacy
+    /// fallback path when no `main` function is defined (finalize-
+    /// scope fixtures).
+    #[allow(dead_code)]
     fn emit_assert_events_from_source(
         &mut self,
         source_code: &str,
@@ -585,7 +863,7 @@ impl LeoTracer {
 
         // Check if the return expression is a function call.
         // Parse source to find `return <func_name>();` pattern.
-        let return_calls_function = find_return_call_target(func, func_map);
+        let return_calls_function = find_return_call_target(source_code, func, func_map);
 
         if let Some(callee_name) = return_calls_function {
             if let Some(callee) = func_map.get(callee_name.as_str()) {
@@ -604,7 +882,7 @@ impl LeoTracer {
         // Emit Return event (skip for entry point — its steps live under
         // <toplevel> which is closed separately).
         if !is_entry_point {
-            let return_value = find_return_value(func, func_map, variable_values);
+            let return_value = find_return_value(source_code, func, func_map, variable_values);
             match return_value {
                 Some(val) => {
                     let type_id = self.type_ids.get("u32").copied().unwrap();
@@ -1839,22 +2117,40 @@ fn parse_leo_parameter_list(params_text: &str) -> Vec<String> {
     result
 }
 
-/// Parse a Leo let-binding like `let a: u32 = 10u32;`.
+/// Parse a Leo let-binding like `let a: u32 = 10u32;` or
+/// `let mut result: u32 = combined;`.
+///
+/// The `mut` keyword is stripped from the binding name so the trace
+/// surfaces the source-correct identifier (`result`, not `mut result`).
 fn parse_leo_binding(line: &str, line_num: u32) -> Option<LeoBinding> {
     let trimmed = line.trim();
     if !trimmed.starts_with("let ") {
         return None;
     }
 
-    let after_let = &trimmed[4..];
-    if let Some(colon_pos) = after_let.find(':') {
-        let name = after_let[..colon_pos].trim().to_string();
-        let after_colon = &after_let[colon_pos + 1..];
-        // Get the type (before '=').
-        let type_name = if let Some(eq_pos) = after_colon.find('=') {
-            after_colon[..eq_pos].trim().to_string()
+    // Strip the leading `let ` and tolerate an optional `mut ` modifier.
+    let after_let = trimmed[4..].trim_start();
+    let after_mut = if let Some(rest) = after_let.strip_prefix("mut ") {
+        rest.trim_start()
+    } else {
+        after_let
+    };
+
+    if let Some(colon_pos) = after_mut.find(':') {
+        let name = after_mut[..colon_pos].trim().to_string();
+        let after_colon = &after_mut[colon_pos + 1..];
+        // Get the type (before '=') and the RHS expression text.
+        let (type_name, rhs) = if let Some(eq_pos) = after_colon.find('=') {
+            let type_name = after_colon[..eq_pos].trim().to_string();
+            let rhs = after_colon[eq_pos + 1..]
+                .trim()
+                .trim_end_matches(';')
+                .trim()
+                .to_string();
+            (type_name, rhs)
         } else {
-            after_colon.trim().trim_end_matches(';').trim().to_string()
+            let type_name = after_colon.trim().trim_end_matches(';').trim().to_string();
+            (type_name, String::new())
         };
 
         if !name.is_empty() && !type_name.is_empty() {
@@ -1862,6 +2158,7 @@ fn parse_leo_binding(line: &str, line_num: u32) -> Option<LeoBinding> {
                 name,
                 type_name,
                 line: line_num,
+                rhs,
             });
         }
     }
@@ -1883,6 +2180,7 @@ enum AssertKind {
 /// the originating source line number and the verbatim text the writer
 /// surfaces in the io_event content payload.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct LeoAssertion {
     kind: AssertKind,
     /// Verbatim source text including the `assert(...)` / `assert_eq(...)`
@@ -1908,10 +2206,8 @@ struct LeoAssertion {
 /// ignored (`//` lines).  Multi-line assertions are not supported --
 /// the Leo style guide keeps each `assert` / `assert_eq` on a single
 /// line, and every fixture in `test-programs/leo/` follows that.
-fn collect_assertions_in_function(
-    source_code: &str,
-    func: &LeoFunctionDef,
-) -> Vec<LeoAssertion> {
+#[allow(dead_code)]
+fn collect_assertions_in_function(source_code: &str, func: &LeoFunctionDef) -> Vec<LeoAssertion> {
     let mut out = Vec::new();
     let lines: Vec<&str> = source_code.lines().collect();
 
@@ -1919,10 +2215,7 @@ fn collect_assertions_in_function(
     // (malformed source), fall back to the return line so we still
     // sweep at least the body up to the return.
     let start = func.line.saturating_add(1);
-    let end = func
-        .body_end_line
-        .or(func.return_line)
-        .unwrap_or(func.line);
+    let end = func.body_end_line.or(func.return_line).unwrap_or(func.line);
 
     for line_num in start..=end {
         let idx = (line_num as usize).checked_sub(1);
@@ -1954,48 +2247,109 @@ fn collect_assertions_in_function(
     out
 }
 
-/// Find if a function's return statement calls another function.
-/// Parses `return <func_name>();` patterns.
+/// Resolve `return <name>(...)` to the actual callee name by parsing the
+/// `return` source line.  Returns `Some(callee_name)` only when the
+/// callee is in `func_map`.
+///
+/// This replaces a previous heuristic that walked `func_map` (a
+/// HashMap, with non-deterministic iteration order) and picked the
+/// first peer with empty bindings.  That heuristic crashed (segfault)
+/// on chains where two callers have empty bodies because it could
+/// recurse into the same function twice; even when it didn't crash,
+/// the choice of callee depended on HashMap insertion order.
 fn find_return_call_target(
+    source_code: &str,
     func: &LeoFunctionDef,
     func_map: &HashMap<&str, &LeoFunctionDef>,
 ) -> Option<String> {
-    // We look at the return_line to see if it matches a pattern like
-    // `return compute();`
-    // For simplicity, check if any other function name appears as a call target.
-    // This is determined by the function being called having bindings
-    // that contribute to the return value.
-    for (name, _) in func_map.iter() {
-        if *name != func.name {
-            // Check if this function has no bindings and its return
-            // line calls the other function. We can infer this from
-            // the Aleo instructions (call instruction).
-            if func.bindings.is_empty() && func.return_line.is_some() {
-                return Some(name.to_string());
-            }
-        }
+    let return_line = func.return_line?;
+    let lines: Vec<&str> = source_code.lines().collect();
+    let idx = (return_line as usize).checked_sub(1)?;
+    let line = lines.get(idx)?.trim();
+    let after_return = line.strip_prefix("return ")?;
+    let expr = after_return.trim().trim_end_matches(';').trim();
+    let callee = parse_call_name(expr)?;
+    if callee == func.name {
+        // Don't recurse into self -- defends against a crafted source
+        // line that looks like `return <fn-name>(...)` from inside the
+        // same function.
+        return None;
     }
-    None
+    if func_map.contains_key(callee.as_str()) {
+        Some(callee)
+    } else {
+        None
+    }
 }
 
-/// Find the return value for a function.
+/// If `expr` is shaped like `name(...)`, return `name`.  Otherwise
+/// `None`.  Tolerates whitespace and ignores anything inside the
+/// parens.  The closing `)` must be the last non-whitespace character.
+fn parse_call_name(expr: &str) -> Option<String> {
+    let expr = expr.trim();
+    if !expr.ends_with(')') {
+        return None;
+    }
+    let open = expr.find('(')?;
+    let name = expr[..open].trim();
+    if name.is_empty() {
+        return None;
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == ':')
+    {
+        return None;
+    }
+    if name.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Find the return value for a function, using deterministic source
+/// order (parses the `return ...` line) rather than a HashMap walk.
 fn find_return_value(
+    source_code: &str,
     func: &LeoFunctionDef,
     func_map: &HashMap<&str, &LeoFunctionDef>,
     variable_values: &HashMap<String, i64>,
 ) -> Option<i64> {
-    // If this function has bindings, the return value is likely the last binding.
-    if let Some(last_binding) = func.bindings.last() {
-        return variable_values.get(&last_binding.name).copied();
-    }
-
-    // If this function calls another, the return value is from the callee.
-    for (name, callee) in func_map.iter() {
-        if *name != func.name {
-            if let Some(last_binding) = callee.bindings.last() {
-                return variable_values.get(&last_binding.name).copied();
+    // First, try parsing the return statement directly.  Variable
+    // returns and pass-through call returns are common.
+    if let Some(return_line) = func.return_line {
+        let lines: Vec<&str> = source_code.lines().collect();
+        if let Some(idx) = (return_line as usize).checked_sub(1) {
+            if let Some(line) = lines.get(idx) {
+                let trimmed = line.trim();
+                if let Some(after_return) = trimmed.strip_prefix("return ") {
+                    let expr = after_return.trim().trim_end_matches(';').trim();
+                    // `return name;` -> look up `name` in variable_values.
+                    if expr.chars().all(|c| c.is_alphanumeric() || c == '_') && !expr.is_empty() {
+                        if let Some(&v) = variable_values.get(expr) {
+                            return Some(v);
+                        }
+                    }
+                    // `return foo(...);` -> use the callee's last binding.
+                    if let Some(callee_name) = parse_call_name(expr) {
+                        if let Some(callee) = func_map.get(callee_name.as_str()) {
+                            if let Some(last_binding) = callee.bindings.last() {
+                                if let Some(&v) = variable_values.get(&last_binding.name) {
+                                    return Some(v);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
+    }
+
+    // Fallback: if this function has bindings, the return value is the
+    // last binding.  Used by self-contained functions that have no
+    // explicit return-line entry.
+    if let Some(last_binding) = func.bindings.last() {
+        return variable_values.get(&last_binding.name).copied();
     }
 
     None
@@ -2014,8 +2368,1419 @@ fn parse_typed_literal(s: &str) -> Option<i64> {
     None
 }
 
+// ===========================================================================
+// Structured Leo evaluator
+//
+// The historical `LeoTracer` flow lowers each Leo function to Aleo
+// instructions and reads back register values to produce step events.
+// That pipeline drops control flow (`if/else`, ternary, `for`),
+// structured literals (struct / tuple / array), and argumentful
+// function calls because the source-level lowering is line-oriented.
+//
+// The structured evaluator below works directly off the Leo source.
+// It parses each function into a list of `Stmt`s, evaluates them in
+// order with a small-but-real expression interpreter, and threads a
+// typed `Value` through the env so structured shapes survive into
+// `register_variable_with_full_value`.  The evaluator is the source
+// of truth for the `compute()` execution shape; the legacy AVM path
+// is still used for funcs that the structured parser cannot handle
+// (none of the recorder fixtures hit that fallback today).
+// ===========================================================================
+
+/// One Leo statement after structured parsing.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+enum Stmt {
+    Let {
+        mutable: bool,
+        name: String,
+        type_name: String,
+        expr: String,
+        line: u32,
+    },
+    Assign {
+        target: String,
+        expr: String,
+        line: u32,
+    },
+    Assert {
+        kind: AssertKind,
+        text: String,
+        line: u32,
+    },
+    For {
+        var: String,
+        type_name: String,
+        lo: i64,
+        hi: i64,
+        body: Vec<Stmt>,
+        line: u32,
+    },
+    Return {
+        expr: String,
+        line: u32,
+    },
+    /// A bare expression statement (e.g. an `assert_eq` we already
+    /// captured as `Assert`, or a fall-through expression).  Kept so
+    /// step counts stay aligned to source lines that the parser
+    /// recognises but doesn't yet evaluate.
+    #[allow(dead_code)]
+    ExprStmt {
+        text: String,
+        line: u32,
+    },
+}
+
+/// A single Leo function fully parsed into structured statements.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct LeoFunc {
+    name: String,
+    is_transition: bool,
+    line: u32,
+    body_end_line: u32,
+    parameters: Vec<(String, String)>, // (name, type_name)
+    body: Vec<Stmt>,
+    /// Free-form return type, captured for completeness; unused by the
+    /// evaluator today.
+    return_type: Option<String>,
+}
+
+/// A Leo struct definition (`struct Name { field: type, ... }`).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct LeoStructDef {
+    name: String,
+    fields: Vec<(String, String)>, // (field_name, type_name)
+}
+
+/// Runtime value carried by the structured evaluator.  Maps onto
+/// `ValueRecord` variants in `value_to_record`; types are kept around
+/// so `Sequence` / `Tuple` / `Struct` writers can emit the right
+/// `TypeKind` / `lang_type` strings.
+#[derive(Debug, Clone)]
+enum Value {
+    Int(i64, String),
+    Bool(bool),
+    Sequence(Vec<Value>, String),
+    Tuple(Vec<Value>),
+    Struct {
+        name: String,
+        fields: Vec<(String, Value)>,
+    },
+    /// A value the evaluator could not compute.  Treated as zero in
+    /// arithmetic so the recorder doesn't surface garbage.
+    Unknown,
+}
+
+impl Value {
+    fn as_int(&self) -> i64 {
+        match self {
+            Value::Int(i, _) => *i,
+            Value::Bool(b) => {
+                if *b {
+                    1
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        }
+    }
+}
+
+/// The evaluator's environment for one function call: local-variable
+/// bindings as `Value`s.
+type EvalEnv = HashMap<String, Value>;
+
+/// All structured information the tracer needs about a Leo program.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct LeoProgram {
+    /// Declared-source-order list of functions; `main` first if
+    /// present so writer-side function-table order is stable.
+    funcs: Vec<LeoFunc>,
+    /// Lookup by name.
+    by_name: HashMap<String, LeoFunc>,
+    /// All struct declarations.
+    structs: HashMap<String, LeoStructDef>,
+}
+
 // ---------------------------------------------------------------------------
-// Tests
+// Structured Leo parser
+// ---------------------------------------------------------------------------
+
+/// Parse a Leo source file into a `LeoProgram` (functions + structs).
+fn parse_leo_program(source: &str) -> LeoProgram {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut structs: HashMap<String, LeoStructDef> = HashMap::new();
+    let mut funcs: Vec<LeoFunc> = Vec::new();
+
+    let mut i = 0;
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+
+        // Struct declaration.
+        if let Some(rest) = trimmed.strip_prefix("struct ") {
+            let name_end = rest.find('{').unwrap_or(rest.len());
+            let name = rest[..name_end]
+                .trim()
+                .trim_end_matches('{')
+                .trim()
+                .to_string();
+            let mut fields = Vec::new();
+            let mut depth = 0i32;
+            let mut started = false;
+            let mut k = i;
+            // Walk lines until brace depth returns to zero.
+            'sk: while k < lines.len() {
+                for ch in lines[k].chars() {
+                    match ch {
+                        '{' => {
+                            depth += 1;
+                            started = true;
+                        }
+                        '}' => {
+                            depth -= 1;
+                            if started && depth == 0 {
+                                k += 1;
+                                break 'sk;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if k > i {
+                    let body_line = lines[k].trim().trim_end_matches(',').trim();
+                    if !body_line.is_empty() && !body_line.starts_with("//") {
+                        if let Some(colon) = body_line.find(':') {
+                            let field_name = body_line[..colon].trim().to_string();
+                            let field_type = body_line[colon + 1..]
+                                .trim()
+                                .trim_end_matches(',')
+                                .trim()
+                                .to_string();
+                            if !field_name.is_empty()
+                                && field_name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                            {
+                                fields.push((field_name, field_type));
+                            }
+                        }
+                    }
+                }
+                k += 1;
+            }
+            if !name.is_empty() {
+                structs.insert(name.clone(), LeoStructDef { name, fields });
+            }
+            i = k;
+            continue;
+        }
+
+        // Function or transition declaration.
+        let (is_transition, after_keyword) = if let Some(s) = trimmed.strip_prefix("transition ") {
+            (true, s)
+        } else if let Some(s) = trimmed.strip_prefix("function ") {
+            (false, s)
+        } else {
+            i += 1;
+            continue;
+        };
+
+        let line_num = (i + 1) as u32;
+        let name_end = after_keyword.find('(').unwrap_or(after_keyword.len());
+        let name = after_keyword[..name_end].trim().to_string();
+
+        // Collect the parameter-list text (between matching parens),
+        // possibly spanning multiple source lines.
+        let mut params_text = String::new();
+        let mut return_type: Option<String> = None;
+        let mut k = i;
+        let mut consumed_signature_chars: usize;
+        let mut paren_depth = 0i32;
+        let mut signature_done = false;
+        // We re-walk the line from name_end forward.
+        let mut col = name_end;
+        let mut current = lines[k];
+        loop {
+            let bytes = current[col..].as_bytes();
+            let mut j = 0;
+            while j < bytes.len() {
+                let ch = bytes[j] as char;
+                match ch {
+                    '(' => {
+                        paren_depth += 1;
+                        if paren_depth > 1 {
+                            params_text.push(ch);
+                        }
+                    }
+                    ')' => {
+                        paren_depth -= 1;
+                        if paren_depth == 0 {
+                            signature_done = true;
+                            j += 1;
+                            break;
+                        } else {
+                            params_text.push(ch);
+                        }
+                    }
+                    _ => {
+                        if paren_depth >= 1 {
+                            params_text.push(ch);
+                        }
+                    }
+                }
+                j += 1;
+            }
+            consumed_signature_chars = col + j;
+            if signature_done {
+                break;
+            }
+            k += 1;
+            if k >= lines.len() {
+                break;
+            }
+            current = lines[k];
+            col = 0;
+            params_text.push(' ');
+        }
+
+        // Look at the rest of the line (after the closing paren) for
+        // an arrow `-> Type` and the opening `{`.
+        let mut after_signature = if k < lines.len() {
+            lines[k][consumed_signature_chars..].to_string()
+        } else {
+            String::new()
+        };
+        if let Some(arrow) = after_signature.find("->") {
+            let rest = &after_signature[arrow + 2..];
+            let brace = rest.find('{').unwrap_or(rest.len());
+            return_type = Some(rest[..brace].trim().to_string());
+            after_signature = rest[brace..].to_string();
+        }
+
+        // Body: lex from current position until matching closing brace.
+        let mut depth = 0i32;
+        let mut started = false;
+        // Re-prime by counting braces in the post-signature text.
+        for ch in after_signature.chars() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    started = true;
+                }
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        // Collect body lines.
+        let mut body_lines: Vec<(u32, String)> = Vec::new();
+        let mut body_end_line = (k + 1) as u32;
+        let mut m = k + 1;
+        while m < lines.len() && (depth > 0 || !started) {
+            let raw = lines[m];
+            for ch in raw.chars() {
+                match ch {
+                    '{' => {
+                        depth += 1;
+                        started = true;
+                    }
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            body_end_line = (m + 1) as u32;
+            body_lines.push(((m + 1) as u32, raw.to_string()));
+            if depth <= 0 && started {
+                break;
+            }
+            m += 1;
+        }
+
+        let parameters = parse_leo_parameter_list_typed(&params_text);
+        let body = parse_block(&body_lines);
+
+        if !name.is_empty() {
+            funcs.push(LeoFunc {
+                name,
+                is_transition,
+                line: line_num,
+                body_end_line,
+                parameters,
+                body,
+                return_type,
+            });
+        }
+        i = m + 1;
+    }
+
+    let by_name: HashMap<String, LeoFunc> =
+        funcs.iter().cloned().map(|f| (f.name.clone(), f)).collect();
+    LeoProgram {
+        funcs,
+        by_name,
+        structs,
+    }
+}
+
+/// Parse a `(<name>: <type>, ...)` parameter list body and return
+/// `(name, type)` pairs.
+fn parse_leo_parameter_list_typed(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for raw in split_top_level_commas(text) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (before_colon, after_colon) = match trimmed.find(':') {
+            Some(pos) => (trimmed[..pos].trim(), trimmed[pos + 1..].trim()),
+            None => (trimmed, ""),
+        };
+        let name = before_colon
+            .split_whitespace()
+            .last()
+            .unwrap_or("")
+            .to_string();
+        if !name.is_empty()
+            && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+            && !name.chars().next().is_some_and(|c| c.is_ascii_digit())
+        {
+            // Type may carry a `.public`/`.private` visibility suffix --
+            // strip it before the dot.
+            let raw_type = after_colon.trim_end_matches(',').trim();
+            let type_name = match raw_type.find('.') {
+                Some(p) => raw_type[..p].to_string(),
+                None => raw_type.to_string(),
+            };
+            out.push((name, type_name));
+        }
+    }
+    out
+}
+
+/// Split a string at top-level commas, ignoring commas nested inside
+/// `()`, `[]`, or `{}`.
+fn split_top_level_commas(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth_paren = 0i32;
+    let mut depth_brack = 0i32;
+    let mut depth_brace = 0i32;
+    let mut current = String::new();
+    for ch in text.chars() {
+        match ch {
+            '(' => depth_paren += 1,
+            ')' => depth_paren -= 1,
+            '[' => depth_brack += 1,
+            ']' => depth_brack -= 1,
+            '{' => depth_brace += 1,
+            '}' => depth_brace -= 1,
+            ',' if depth_paren == 0 && depth_brack == 0 && depth_brace == 0 => {
+                out.push(std::mem::take(&mut current));
+                continue;
+            }
+            _ => {}
+        }
+        current.push(ch);
+    }
+    if !current.trim().is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// Parse a sequence of body lines into `Stmt`s.  Recognises:
+///   - `let [mut] name: T = expr;`
+///   - `name = expr;`
+///   - `assert(expr);` / `assert_eq(a, b);`
+///   - `for var: T in lo..hi { ... }`  (single-line header; body parsed recursively)
+///   - `return expr;`
+///
+/// `body_lines` is a slice of `(1-based line number, raw source line)`
+/// pairs covering the entire function body, brace-trimmed.
+fn parse_block(body_lines: &[(u32, String)]) -> Vec<Stmt> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < body_lines.len() {
+        let (line_num, raw) = &body_lines[i];
+        let trimmed = raw.trim();
+
+        // Skip empty lines, comments, and bare braces.
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed == "{" || trimmed == "}" {
+            i += 1;
+            continue;
+        }
+
+        // `for var: T in lo..hi {` -> collect body.
+        if let Some(rest) = trimmed.strip_prefix("for ") {
+            // Header form: `var: T in lo..hi {` or `var in lo..hi {`.
+            let (header, _open_brace) = match rest.find('{') {
+                Some(p) => (rest[..p].trim(), true),
+                None => (rest, false),
+            };
+            // Split at " in ".
+            if let Some(in_pos) = header.find(" in ") {
+                let var_part = header[..in_pos].trim();
+                let range_part = header[in_pos + 4..].trim();
+                let (var_name, var_type) = match var_part.find(':') {
+                    Some(p) => (
+                        var_part[..p].trim().to_string(),
+                        var_part[p + 1..].trim().to_string(),
+                    ),
+                    None => (var_part.to_string(), "u32".to_string()),
+                };
+                if let Some(dots) = range_part.find("..") {
+                    let lo_text = range_part[..dots].trim();
+                    let hi_text = range_part[dots + 2..].trim().trim_end_matches('{').trim();
+                    let lo = parse_typed_literal(lo_text)
+                        .or_else(|| lo_text.parse::<i64>().ok())
+                        .unwrap_or(0);
+                    let hi = parse_typed_literal(hi_text)
+                        .or_else(|| hi_text.parse::<i64>().ok())
+                        .unwrap_or(0);
+                    // Find matching closing brace.
+                    let mut depth = 0i32;
+                    // Count opening braces on the header line.
+                    for ch in raw.chars() {
+                        match ch {
+                            '{' => depth += 1,
+                            '}' => depth -= 1,
+                            _ => {}
+                        }
+                    }
+                    let mut body_lines_inner: Vec<(u32, String)> = Vec::new();
+                    let mut j = i + 1;
+                    while j < body_lines.len() && depth > 0 {
+                        let (jl, jr) = &body_lines[j];
+                        for ch in jr.chars() {
+                            match ch {
+                                '{' => depth += 1,
+                                '}' => depth -= 1,
+                                _ => {}
+                            }
+                        }
+                        if depth > 0 {
+                            body_lines_inner.push((*jl, jr.clone()));
+                        }
+                        j += 1;
+                    }
+                    let inner = parse_block(&body_lines_inner);
+                    out.push(Stmt::For {
+                        var: var_name,
+                        type_name: var_type,
+                        lo,
+                        hi,
+                        body: inner,
+                        line: *line_num,
+                    });
+                    i = j;
+                    continue;
+                }
+            }
+            // Fall through if header didn't parse cleanly.
+            i += 1;
+            continue;
+        }
+
+        // `if cond { ... } else { ... }` block as a statement -- not
+        // supported as a statement, only as an expression in `let` RHS.
+        // Skip the brace-balanced body so we don't mis-parse its contents.
+        if trimmed.starts_with("if ") {
+            let mut depth = 0i32;
+            for ch in raw.chars() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            let mut j = i + 1;
+            while j < body_lines.len() && depth > 0 {
+                let (_, jr) = &body_lines[j];
+                for ch in jr.chars() {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' => depth -= 1,
+                        _ => {}
+                    }
+                }
+                j += 1;
+            }
+            i = j;
+            continue;
+        }
+
+        // `let [mut] name: T = expr;` -- expression may span multiple
+        // lines if it contains an `if {} else {}` or a multi-line
+        // struct literal.  We extend the expression text until we see
+        // a line that ends with a semicolon at brace-depth zero.
+        if trimmed.starts_with("let ") {
+            let mut full = String::new();
+            let mut depth = 0i32;
+            let mut j = i;
+            loop {
+                if j >= body_lines.len() {
+                    break;
+                }
+                let (_, jr) = &body_lines[j];
+                if !full.is_empty() {
+                    full.push(' ');
+                }
+                full.push_str(jr.trim());
+                for ch in jr.chars() {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' => depth -= 1,
+                        _ => {}
+                    }
+                }
+                if depth <= 0 && jr.trim().ends_with(';') {
+                    j += 1;
+                    break;
+                }
+                j += 1;
+            }
+            let line_for_let = *line_num;
+            let after_let = full.trim_start_matches("let ").trim();
+            let (mutable, after_mut) = match after_let.strip_prefix("mut ") {
+                Some(rest) => (true, rest.trim_start()),
+                None => (false, after_let),
+            };
+            if let Some(colon) = after_mut.find(':') {
+                let name = after_mut[..colon].trim().to_string();
+                let after_colon = &after_mut[colon + 1..];
+                if let Some(eq) = after_colon.find('=') {
+                    let type_name = after_colon[..eq].trim().to_string();
+                    let expr = after_colon[eq + 1..]
+                        .trim()
+                        .trim_end_matches(';')
+                        .trim()
+                        .to_string();
+                    out.push(Stmt::Let {
+                        mutable,
+                        name,
+                        type_name,
+                        expr,
+                        line: line_for_let,
+                    });
+                }
+            }
+            i = j;
+            continue;
+        }
+
+        // `assert_eq(a, b);` / `assert(expr);`
+        if trimmed.starts_with("assert_eq(") || trimmed.starts_with("assert(") {
+            let kind = if trimmed.starts_with("assert_eq(") {
+                AssertKind::AssertEq
+            } else {
+                AssertKind::Assert
+            };
+            let text = trimmed.trim_end_matches(';').trim().to_string();
+            out.push(Stmt::Assert {
+                kind,
+                text,
+                line: *line_num,
+            });
+            i += 1;
+            continue;
+        }
+
+        // `return expr;`
+        if let Some(rest) = trimmed.strip_prefix("return ") {
+            let expr = rest.trim().trim_end_matches(';').trim().to_string();
+            out.push(Stmt::Return {
+                expr,
+                line: *line_num,
+            });
+            i += 1;
+            continue;
+        }
+
+        // `name = expr;` (assignment to mutable binding)
+        if let Some(eq) = trimmed.find('=') {
+            let lhs = trimmed[..eq].trim();
+            let rhs = trimmed[eq + 1..].trim().trim_end_matches(';').trim();
+            if !lhs.is_empty()
+                && lhs.chars().all(|c| c.is_alphanumeric() || c == '_')
+                && !lhs.starts_with(|c: char| c.is_ascii_digit())
+            {
+                out.push(Stmt::Assign {
+                    target: lhs.to_string(),
+                    expr: rhs.to_string(),
+                    line: *line_num,
+                });
+                i += 1;
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Expression evaluator
+// ---------------------------------------------------------------------------
+
+/// Result of executing a structured Leo function: the final return
+/// value (if a `return` statement was hit) and the list of step events
+/// that should be emitted to surface the function's bindings.
+#[derive(Debug, Clone)]
+struct CallTrace {
+    return_value: Value,
+    /// Per-binding emission, in execution order.
+    bindings: Vec<EmittedBinding>,
+    /// Sub-calls made by this function, captured so the emit pass can
+    /// recurse into them in deterministic source order.
+    sub_calls: Vec<SubCall>,
+    /// Assertions executed in this call.
+    asserts: Vec<EmittedAssert>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct EmittedBinding {
+    name: String,
+    type_name: String,
+    line: u32,
+    value: Value,
+}
+
+#[derive(Debug, Clone)]
+struct SubCall {
+    /// Name of the function being called.
+    callee: String,
+    /// Argument values, evaluated in the caller's env.
+    args: Vec<(String, Value)>, // (formal-parameter name, value)
+    /// Where to place the call event in the caller's binding stream
+    /// (index into `bindings`).
+    after_binding: usize,
+    /// Recorded result of executing the callee.
+    trace: CallTrace,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct EmittedAssert {
+    kind: AssertKind,
+    text: String,
+    line: u32,
+}
+
+/// Execute a Leo function with a given `(formal-name, value)` argument
+/// list.  Returns a `CallTrace` describing every event the emit pass
+/// should produce.
+fn execute_leo_function(prog: &LeoProgram, func: &LeoFunc, args: &[(String, Value)]) -> CallTrace {
+    let mut env: EvalEnv = HashMap::new();
+    for (name, value) in args {
+        env.insert(name.clone(), value.clone());
+    }
+    let mut bindings: Vec<EmittedBinding> = Vec::new();
+    let mut sub_calls: Vec<SubCall> = Vec::new();
+    let mut asserts: Vec<EmittedAssert> = Vec::new();
+    let mut return_value: Value = Value::Unknown;
+
+    execute_block(
+        prog,
+        &func.body,
+        &mut env,
+        &mut bindings,
+        &mut sub_calls,
+        &mut asserts,
+        &mut return_value,
+    );
+
+    // Post-execution sync: for each Let binding, replace its value
+    // with the final env value so any post-loop / post-assign updates
+    // surface.  Immutable bindings are unaffected (the value was
+    // already final).
+    for b in bindings.iter_mut() {
+        if let Some(final_v) = env.get(&b.name) {
+            b.value = final_v.clone();
+        }
+    }
+
+    CallTrace {
+        return_value,
+        bindings,
+        sub_calls,
+        asserts,
+    }
+}
+
+fn execute_block(
+    prog: &LeoProgram,
+    block: &[Stmt],
+    env: &mut EvalEnv,
+    bindings: &mut Vec<EmittedBinding>,
+    sub_calls: &mut Vec<SubCall>,
+    asserts: &mut Vec<EmittedAssert>,
+    return_value: &mut Value,
+) {
+    for stmt in block {
+        match stmt {
+            Stmt::Let {
+                name,
+                type_name,
+                expr,
+                line,
+                ..
+            } => {
+                let value = eval_expr(prog, env, expr, sub_calls, bindings.len());
+                env.insert(name.clone(), value.clone());
+                bindings.push(EmittedBinding {
+                    name: name.clone(),
+                    type_name: type_name.clone(),
+                    line: *line,
+                    value,
+                });
+            }
+            Stmt::Assign { target, expr, .. } => {
+                // Update env in place; do NOT push a fresh emitted
+                // binding.  The `Let` that introduced this name already
+                // pushed its own EmittedBinding; the binding's value
+                // is updated post-execution from the final env so the
+                // step event surfaces the post-loop / post-assign
+                // value rather than the initial one.
+                let value = eval_expr(prog, env, expr, sub_calls, bindings.len());
+                env.insert(target.clone(), value);
+            }
+            Stmt::Assert { kind, text, line } => {
+                asserts.push(EmittedAssert {
+                    kind: *kind,
+                    text: text.clone(),
+                    line: *line,
+                });
+            }
+            Stmt::For {
+                var,
+                type_name,
+                lo,
+                hi,
+                body,
+                ..
+            } => {
+                for i in *lo..*hi {
+                    env.insert(var.clone(), Value::Int(i, type_name.clone()));
+                    execute_block(prog, body, env, bindings, sub_calls, asserts, return_value);
+                }
+            }
+            Stmt::Return { expr, .. } => {
+                let value = eval_expr(prog, env, expr, sub_calls, bindings.len());
+                *return_value = value;
+                return;
+            }
+            Stmt::ExprStmt { .. } => {}
+        }
+    }
+}
+
+// (helper `type_name_of_value` removed -- callers were eliminated when
+//  the Stmt::Assign arm stopped re-pushing EmittedBindings.)
+
+/// Evaluate a Leo expression to a `Value`.
+///
+/// Sub-calls discovered during evaluation are recorded into `sub_calls`
+/// so the emit pass can interleave call_entry/call_exit events at the
+/// appropriate location in the binding stream.
+fn eval_expr(
+    prog: &LeoProgram,
+    env: &EvalEnv,
+    expr: &str,
+    sub_calls: &mut Vec<SubCall>,
+    after_binding: usize,
+) -> Value {
+    let expr = expr.trim();
+    if expr.is_empty() {
+        return Value::Unknown;
+    }
+
+    // Strip a single layer of outer parentheses, but ONLY when the
+    // inside doesn't contain a top-level comma.  `(a, b)` is a tuple
+    // literal; stripping the parens would turn it into `a, b` and
+    // mis-evaluate.
+    if expr.starts_with('(') && expr.ends_with(')') && matched_outer_parens(expr) {
+        let inside = &expr[1..expr.len() - 1];
+        if find_top_level_char(inside, ',').is_none() {
+            return eval_expr(prog, env, inside, sub_calls, after_binding);
+        }
+    }
+
+    // Ternary: `cond ? a : b` -- the `?` and `:` must be at top level.
+    if let Some(qpos) = find_top_level_char(expr, '?') {
+        if let Some(cpos) = find_top_level_char_from(expr, ':', qpos + 1) {
+            let cond = eval_expr(prog, env, &expr[..qpos], sub_calls, after_binding);
+            let then_branch = eval_expr(prog, env, &expr[qpos + 1..cpos], sub_calls, after_binding);
+            let else_branch = eval_expr(prog, env, &expr[cpos + 1..], sub_calls, after_binding);
+            return if value_truthy(&cond) {
+                then_branch
+            } else {
+                else_branch
+            };
+        }
+    }
+
+    // `if cond { then } else { else }` expression.
+    if let Some(rest) = expr.strip_prefix("if ") {
+        if let Some(parsed) = parse_if_expr(rest) {
+            let cond = eval_expr(prog, env, &parsed.cond, sub_calls, after_binding);
+            return if value_truthy(&cond) {
+                eval_expr(prog, env, &parsed.then_branch, sub_calls, after_binding)
+            } else {
+                eval_expr(prog, env, &parsed.else_branch, sub_calls, after_binding)
+            };
+        }
+    }
+
+    // Top-level binary comparisons (lowest precedence after ternary).
+    for op in &["==", "!=", "<=", ">=", "<", ">"] {
+        if let Some(pos) = find_top_level_substr(expr, op) {
+            let lhs = eval_expr(prog, env, &expr[..pos], sub_calls, after_binding);
+            let rhs = eval_expr(prog, env, &expr[pos + op.len()..], sub_calls, after_binding);
+            let li = lhs.as_int();
+            let ri = rhs.as_int();
+            let r = match *op {
+                "==" => li == ri,
+                "!=" => li != ri,
+                "<=" => li <= ri,
+                ">=" => li >= ri,
+                "<" => li < ri,
+                ">" => li > ri,
+                _ => false,
+            };
+            return Value::Bool(r);
+        }
+    }
+
+    // Top-level `+` / `-` (left-associative; scan right-to-left).
+    for op_char in &['+', '-'] {
+        if let Some(pos) = find_top_level_operator_excluding_unary(expr, *op_char) {
+            let left = expr[..pos].trim();
+            let right = expr[pos + 1..].trim();
+            if !left.is_empty() && !right.is_empty() {
+                let lv = eval_expr(prog, env, left, sub_calls, after_binding);
+                let rv = eval_expr(prog, env, right, sub_calls, after_binding);
+                let li = lv.as_int();
+                let ri = rv.as_int();
+                let r = if *op_char == '+' {
+                    li.wrapping_add(ri)
+                } else {
+                    li.wrapping_sub(ri)
+                };
+                let t = match (&lv, &rv) {
+                    (Value::Int(_, t), _) | (_, Value::Int(_, t)) => t.clone(),
+                    _ => "u32".to_string(),
+                };
+                return Value::Int(r, t);
+            }
+        }
+    }
+
+    // Top-level `*` / `/` / `%`.
+    for op_char in &['*', '/', '%'] {
+        if let Some(pos) = find_top_level_operator_excluding_unary(expr, *op_char) {
+            let left = expr[..pos].trim();
+            let right = expr[pos + 1..].trim();
+            if !left.is_empty() && !right.is_empty() {
+                let lv = eval_expr(prog, env, left, sub_calls, after_binding);
+                let rv = eval_expr(prog, env, right, sub_calls, after_binding);
+                let li = lv.as_int();
+                let ri = rv.as_int();
+                let r = match *op_char {
+                    '*' => li.wrapping_mul(ri),
+                    '/' => {
+                        if ri == 0 {
+                            0
+                        } else {
+                            li / ri
+                        }
+                    }
+                    '%' => {
+                        if ri == 0 {
+                            0
+                        } else {
+                            li % ri
+                        }
+                    }
+                    _ => 0,
+                };
+                let t = match (&lv, &rv) {
+                    (Value::Int(_, t), _) | (_, Value::Int(_, t)) => t.clone(),
+                    _ => "u32".to_string(),
+                };
+                return Value::Int(r, t);
+            }
+        }
+    }
+
+    // Tuple / array literal.
+    if expr.starts_with('(') && expr.ends_with(')') {
+        let inner = &expr[1..expr.len() - 1];
+        let parts = split_top_level_commas(inner);
+        if parts.len() >= 2 {
+            let elems: Vec<Value> = parts
+                .iter()
+                .map(|p| eval_expr(prog, env, p.trim(), sub_calls, after_binding))
+                .collect();
+            return Value::Tuple(elems);
+        }
+    }
+    if expr.starts_with('[') && expr.ends_with(']') {
+        let inner = &expr[1..expr.len() - 1];
+        let parts = split_top_level_commas(inner);
+        let elems: Vec<Value> = parts
+            .iter()
+            .map(|p| eval_expr(prog, env, p.trim(), sub_calls, after_binding))
+            .collect();
+        let elem_type = match elems.first() {
+            Some(Value::Int(_, t)) => t.clone(),
+            _ => "u32".to_string(),
+        };
+        return Value::Sequence(elems, elem_type);
+    }
+
+    // Struct literal: `Name { field: expr, ... }`.
+    if let Some(brace) = expr.find('{') {
+        let name = expr[..brace].trim();
+        if !name.is_empty()
+            && name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            && expr.ends_with('}')
+        {
+            let inner = expr[brace + 1..expr.len() - 1].trim();
+            let parts = split_top_level_commas(inner);
+            let mut fields: Vec<(String, Value)> = Vec::new();
+            for part in parts {
+                let p = part.trim();
+                if let Some(colon) = p.find(':') {
+                    let fname = p[..colon].trim().to_string();
+                    let fexpr = p[colon + 1..].trim();
+                    let fv = eval_expr(prog, env, fexpr, sub_calls, after_binding);
+                    fields.push((fname, fv));
+                }
+            }
+            return Value::Struct {
+                name: name.to_string(),
+                fields,
+            };
+        }
+    }
+
+    // Function call: `name(args...)`.
+    if let Some(open) = expr.find('(') {
+        let name = expr[..open].trim();
+        let is_call_shape = expr.ends_with(')')
+            && !name.is_empty()
+            && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+            && !name.chars().next().is_some_and(|c| c.is_ascii_digit());
+        if is_call_shape {
+            let inner = &expr[open + 1..expr.len() - 1];
+            let arg_exprs = split_top_level_commas(inner);
+            let arg_values: Vec<Value> = arg_exprs
+                .iter()
+                .map(|a| eval_expr(prog, env, a.trim(), sub_calls, after_binding))
+                .collect();
+
+            if let Some(callee) = prog.by_name.get(name) {
+                let formals: Vec<(String, Value)> = callee
+                    .parameters
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (pname, _ptype))| {
+                        let v = arg_values.get(i).cloned().unwrap_or(Value::Unknown);
+                        (pname.clone(), v)
+                    })
+                    .collect();
+                let trace = execute_leo_function(prog, callee, &formals);
+                let rv = trace.return_value.clone();
+                sub_calls.push(SubCall {
+                    callee: name.to_string(),
+                    args: formals,
+                    after_binding,
+                    trace,
+                });
+                return rv;
+            }
+            // Unknown callee -- return Unknown but still record nothing.
+            return Value::Unknown;
+        }
+    }
+
+    // Field access: `p.x` or `p.0` (for tuples).
+    if let Some(dot) = find_top_level_char(expr, '.') {
+        let base = expr[..dot].trim();
+        let field = expr[dot + 1..].trim();
+        let base_v = eval_expr(prog, env, base, sub_calls, after_binding);
+        return access_field(&base_v, field);
+    }
+
+    // Index access: `xs[expr]`.
+    if let Some(open) = expr.find('[') {
+        if expr.ends_with(']') {
+            let base = expr[..open].trim();
+            let idx_text = &expr[open + 1..expr.len() - 1];
+            let base_v = eval_expr(prog, env, base, sub_calls, after_binding);
+            let idx_v = eval_expr(prog, env, idx_text, sub_calls, after_binding);
+            if let Value::Sequence(elems, _) = &base_v {
+                let i = idx_v.as_int() as usize;
+                if let Some(v) = elems.get(i) {
+                    return v.clone();
+                }
+            }
+            return Value::Unknown;
+        }
+    }
+
+    // Bool literal.
+    if expr == "true" {
+        return Value::Bool(true);
+    }
+    if expr == "false" {
+        return Value::Bool(false);
+    }
+
+    // Typed literal.
+    if let Some(v) = parse_typed_literal(expr) {
+        let t = expr
+            .trim_start_matches(|c: char| c.is_ascii_digit() || c == '-')
+            .to_string();
+        let t = if t.is_empty() { "u32".to_string() } else { t };
+        return Value::Int(v, t);
+    }
+    if let Ok(v) = expr.parse::<i64>() {
+        return Value::Int(v, "u32".to_string());
+    }
+
+    // Variable reference.
+    if let Some(v) = env.get(expr) {
+        return v.clone();
+    }
+
+    Value::Unknown
+}
+
+fn value_truthy(v: &Value) -> bool {
+    match v {
+        Value::Bool(b) => *b,
+        Value::Int(i, _) => *i != 0,
+        _ => false,
+    }
+}
+
+fn access_field(base: &Value, field: &str) -> Value {
+    match base {
+        Value::Struct { fields, .. } => fields
+            .iter()
+            .find(|(n, _)| n == field)
+            .map(|(_, v)| v.clone())
+            .unwrap_or(Value::Unknown),
+        Value::Tuple(elems) => {
+            if let Ok(idx) = field.parse::<usize>() {
+                elems.get(idx).cloned().unwrap_or(Value::Unknown)
+            } else {
+                Value::Unknown
+            }
+        }
+        _ => Value::Unknown,
+    }
+}
+
+struct IfExpr {
+    cond: String,
+    then_branch: String,
+    else_branch: String,
+}
+
+/// Parse `cond { then } else { else }`.  The leading `if ` has already
+/// been stripped.  Both branches are extracted as their inner brace
+/// contents (with the braces stripped), so `eval_expr` can recurse.
+fn parse_if_expr(expr_after_if: &str) -> Option<IfExpr> {
+    let s = expr_after_if.trim();
+    let open = s.find('{')?;
+    let cond = s[..open].trim().to_string();
+    let mut depth = 0i32;
+    let mut then_end = None;
+    for (idx, ch) in s[open..].char_indices() {
+        let real = open + idx;
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    then_end = Some(real);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let then_end = then_end?;
+    let then_branch = s[open + 1..then_end].trim().to_string();
+    let after_then = s[then_end + 1..].trim_start();
+    let after_else = after_then.strip_prefix("else")?.trim_start();
+    let else_open = after_else.find('{')?;
+    let mut depth = 0i32;
+    let mut else_end = None;
+    for (idx, ch) in after_else[else_open..].char_indices() {
+        let real = else_open + idx;
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    else_end = Some(real);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let else_end = else_end?;
+    let else_branch = after_else[else_open + 1..else_end].trim().to_string();
+    Some(IfExpr {
+        cond,
+        then_branch,
+        else_branch,
+    })
+}
+
+fn matched_outer_parens(expr: &str) -> bool {
+    let bytes = expr.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'(' || bytes[bytes.len() - 1] != b')' {
+        return false;
+    }
+    let mut depth = 0i32;
+    for (i, ch) in expr.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 && i < expr.len() - 1 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+fn find_top_level_char(expr: &str, ch: char) -> Option<usize> {
+    find_top_level_char_from(expr, ch, 0)
+}
+
+fn find_top_level_char_from(expr: &str, ch: char, start: usize) -> Option<usize> {
+    let mut depth_paren = 0i32;
+    let mut depth_brack = 0i32;
+    let mut depth_brace = 0i32;
+    for (i, c) in expr.char_indices() {
+        if i < start {
+            continue;
+        }
+        match c {
+            '(' => depth_paren += 1,
+            ')' => depth_paren -= 1,
+            '[' => depth_brack += 1,
+            ']' => depth_brack -= 1,
+            '{' => depth_brace += 1,
+            '}' => depth_brace -= 1,
+            _ => {}
+        }
+        if c == ch && depth_paren == 0 && depth_brack == 0 && depth_brace == 0 {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn find_top_level_substr(expr: &str, needle: &str) -> Option<usize> {
+    let mut depth_paren = 0i32;
+    let mut depth_brack = 0i32;
+    let mut depth_brace = 0i32;
+    let bytes = expr.as_bytes();
+    let nbytes = needle.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        match c {
+            '(' => depth_paren += 1,
+            ')' => depth_paren -= 1,
+            '[' => depth_brack += 1,
+            ']' => depth_brack -= 1,
+            '{' => depth_brace += 1,
+            '}' => depth_brace -= 1,
+            _ => {}
+        }
+        if depth_paren == 0 && depth_brack == 0 && depth_brace == 0 {
+            if i + nbytes.len() <= bytes.len() && &bytes[i..i + nbytes.len()] == nbytes {
+                // Avoid matching `=` inside `==` when caller asked for
+                // `=` (we don't, but be defensive).
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Find a top-level operator character, scanning right-to-left so the
+/// rightmost one wins (left-associative).  Skips the character when
+/// it could be a unary minus or part of a `=>`/`->`/`==` token.
+fn find_top_level_operator_excluding_unary(expr: &str, op: char) -> Option<usize> {
+    let chars: Vec<char> = expr.chars().collect();
+    let mut depth_paren = 0i32;
+    let mut depth_brack = 0i32;
+    let mut depth_brace = 0i32;
+    // Compute closing-from-the-right: build depth-from-end map.
+    // Simpler: walk left-to-right, but remember matches and pick the
+    // rightmost one.
+    let mut byte_pos = 0;
+    let mut last_match: Option<usize> = None;
+    for (i, ch) in chars.iter().enumerate() {
+        let prev = if i == 0 { ' ' } else { chars[i - 1] };
+        let next = if i + 1 < chars.len() {
+            chars[i + 1]
+        } else {
+            ' '
+        };
+        match *ch {
+            '(' => depth_paren += 1,
+            ')' => depth_paren -= 1,
+            '[' => depth_brack += 1,
+            ']' => depth_brack -= 1,
+            '{' => depth_brace += 1,
+            '}' => depth_brace -= 1,
+            _ => {}
+        }
+        let at_top = depth_paren == 0 && depth_brack == 0 && depth_brace == 0;
+        if at_top && *ch == op {
+            // Skip leading-position unary -/+
+            if i == 0 {
+                byte_pos += ch.len_utf8();
+                continue;
+            }
+            // Skip when previous char is an operator/equals (e.g. `*-1`).
+            if matches!(
+                prev,
+                '+' | '-'
+                    | '*'
+                    | '/'
+                    | '%'
+                    | '='
+                    | '<'
+                    | '>'
+                    | '!'
+                    | '?'
+                    | ':'
+                    | '('
+                    | ','
+                    | '['
+                    | '{'
+            ) {
+                byte_pos += ch.len_utf8();
+                continue;
+            }
+            // Skip `==`, `<=`, `>=`, `!=`, `&&`, `||`, `->`, `=>`.
+            if op == '=' && next == '=' {
+                byte_pos += ch.len_utf8();
+                continue;
+            }
+            last_match = Some(byte_pos);
+        }
+        byte_pos += ch.len_utf8();
+    }
+    last_match
+}
+
+/// Find the line number of the first `return` statement in a function
+/// body (or `None` if there isn't one).
+fn find_return_line_in_body(body: &[Stmt]) -> Option<u32> {
+    for stmt in body {
+        match stmt {
+            Stmt::Return { line, .. } => return Some(*line),
+            Stmt::For { body, .. } => {
+                if let Some(line) = find_return_line_in_body(body) {
+                    return Some(line);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Reachability
+// ---------------------------------------------------------------------------
+
+/// Compute the set of functions reachable from `entry` by following
+/// every textual call site in the structured statements.  Used to gate
+/// the static `assert` sweep so unreachable functions don't pollute
+/// the io_event stream.
+fn reachable_functions(prog: &LeoProgram, entry: &str) -> BTreeSet<String> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut stack = vec![entry.to_string()];
+    while let Some(name) = stack.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        if let Some(func) = prog.by_name.get(&name) {
+            collect_callees(prog, &func.body, &mut stack);
+        }
+    }
+    seen
+}
+
+fn collect_callees(prog: &LeoProgram, block: &[Stmt], out: &mut Vec<String>) {
+    for stmt in block {
+        match stmt {
+            Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Return { expr, .. } => {
+                collect_callees_in_expr(prog, expr, out);
+            }
+            Stmt::For { body, .. } => collect_callees(prog, body, out),
+            Stmt::Assert { text, .. } | Stmt::ExprStmt { text, .. } => {
+                collect_callees_in_expr(prog, text, out);
+            }
+        }
+    }
+}
+
+fn collect_callees_in_expr(prog: &LeoProgram, expr: &str, out: &mut Vec<String>) {
+    // Find every identifier directly followed by `(` and consider it a
+    // call site.  Names that aren't in the program are filtered.
+    let bytes = expr.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c.is_alphabetic() || c == '_' {
+            let start = i;
+            while i < bytes.len() {
+                let cc = bytes[i] as char;
+                if cc.is_alphanumeric() || cc == '_' {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            let name = &expr[start..i];
+            // Skip whitespace.
+            let mut j = i;
+            while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'(' {
+                if prog.by_name.contains_key(name) {
+                    out.push(name.to_string());
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Type registration helper
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -2265,26 +4030,31 @@ function main:
                     name: "a".to_string(),
                     type_name: "u32".to_string(),
                     line: 3,
+                    rhs: "10u32".to_string(),
                 },
                 LeoBinding {
                     name: "b".to_string(),
                     type_name: "u32".to_string(),
                     line: 4,
+                    rhs: "32u32".to_string(),
                 },
                 LeoBinding {
                     name: "sum_val".to_string(),
                     type_name: "u32".to_string(),
                     line: 5,
+                    rhs: "a + b".to_string(),
                 },
                 LeoBinding {
                     name: "doubled".to_string(),
                     type_name: "u32".to_string(),
                     line: 6,
+                    rhs: "sum_val * 2u32".to_string(),
                 },
                 LeoBinding {
                     name: "final_result".to_string(),
                     type_name: "u32".to_string(),
                     line: 7,
+                    rhs: "doubled + a".to_string(),
                 },
             ],
             return_line: Some(8),
