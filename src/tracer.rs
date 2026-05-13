@@ -653,6 +653,21 @@ impl LeoTracer {
             );
         }
 
+        // Emit io_events for hash-builtin calls and finalize-scope
+        // mapping ops surfaced by the structured evaluator.  Reads
+        // (`Mapping::get*`, hash-builtin evaluations) carry
+        // EventLogKind::Read; writes (`Mapping::set/remove`)
+        // carry EventLogKind::Write.  Each event's `text` field
+        // round-trips the verbatim source-level expression.
+        for e in &trace.io_events {
+            let kind = if e.is_write {
+                EventLogKind::Write
+            } else {
+                EventLogKind::Read
+            };
+            TraceWriter::register_special_event(&mut *self.writer, kind, e.metadata, &e.text);
+        }
+
         // Emit the return-statement step (so the line of the `return`
         // shows up in the trace, matching the legacy AVM emit shape).
         let return_line = find_return_line_in_body(&func.body).unwrap_or(func.body_end_line);
@@ -1928,9 +1943,15 @@ fn parse_leo_functions(source: &str) -> Vec<LeoFunctionDef> {
         let trimmed = lines[i].trim();
         let line_num = (i + 1) as u32;
 
-        // Check for transition or function definition.
+        // Check for transition or function definition.  `async
+        // transition` and `async function` are accepted with the
+        // same shape as the un-prefixed variants.
         let (is_transition, after_keyword) =
-            if let Some(stripped) = trimmed.strip_prefix("transition ") {
+            if let Some(stripped) = trimmed.strip_prefix("async transition ") {
+                (true, stripped)
+            } else if let Some(stripped) = trimmed.strip_prefix("async function ") {
+                (false, stripped)
+            } else if let Some(stripped) = trimmed.strip_prefix("transition ") {
                 (true, stripped)
             } else if let Some(stripped) = trimmed.strip_prefix("function ") {
                 (false, stripped)
@@ -2357,8 +2378,15 @@ fn find_return_value(
 
 /// Parse a typed Leo literal like `10u32`, `42u64`, `10field`, `5i32`.
 fn parse_typed_literal(s: &str) -> Option<i64> {
-    // Try each known type suffix.
-    for suffix in &["u32", "u64", "u128", "i32", "i64", "i128", "field"] {
+    // Try each known type suffix.  `field`, `group`, and `scalar`
+    // are Leo's native curve types -- the source-level evaluator
+    // surfaces them as `Int(value, "<suffix>")` so downstream
+    // tooling can distinguish them via `type_id`.  Real curve math
+    // lives in snarkVM and is not modelled here.
+    for suffix in &[
+        "u32", "u64", "u128", "u8", "u16", "i32", "i64", "i128", "i8", "i16", "field", "group",
+        "scalar",
+    ] {
         if let Some(num_str) = s.strip_suffix(suffix) {
             if let Ok(val) = num_str.parse::<i64>() {
                 return Some(val);
@@ -2520,8 +2548,18 @@ fn parse_leo_program(source: &str) -> LeoProgram {
     while i < lines.len() {
         let trimmed = lines[i].trim();
 
-        // Struct declaration.
-        if let Some(rest) = trimmed.strip_prefix("struct ") {
+        // Struct or record declaration.  Aleo's `record` keyword is
+        // a struct-shaped UTXO primitive: `record Token { owner:
+        // address, amount: u64 }`.  The structured evaluator treats
+        // it as a `Value::Struct` -- the `owner` field is surfaced
+        // as a u32 stand-in (the source-level evaluator does not
+        // model addresses as a distinct value kind) but the
+        // mint/transfer/burn lifecycle calls flow through the call
+        // graph as regular function calls.
+        if let Some(rest) = trimmed
+            .strip_prefix("struct ")
+            .or_else(|| trimmed.strip_prefix("record "))
+        {
             let name_end = rest.find('{').unwrap_or(rest.len());
             let name = rest[..name_end]
                 .trim()
@@ -2577,8 +2615,21 @@ fn parse_leo_program(source: &str) -> LeoProgram {
             continue;
         }
 
-        // Function or transition declaration.
-        let (is_transition, after_keyword) = if let Some(s) = trimmed.strip_prefix("transition ") {
+        // Function or transition declaration.  Aleo's `async`
+        // qualifier prefixes either a transition (the on-chain
+        // entry point that emits a Future) or a function (the
+        // finalize handler that consumes the Future and runs in the
+        // on-chain finalize scope).  The recorder treats them as
+        // ordinary functions for evaluation purposes; the
+        // distinction matters only for `Mapping::*` ops, which the
+        // evaluator surfaces as io_events regardless.
+        let stripped_async = trimmed
+            .strip_prefix("async transition ")
+            .or_else(|| trimmed.strip_prefix("async function "));
+        let (is_transition, after_keyword) = if let Some(s) = stripped_async {
+            // `async transition` => is_transition true; `async function` => false.
+            (trimmed.starts_with("async transition "), s)
+        } else if let Some(s) = trimmed.strip_prefix("transition ") {
             (true, s)
         } else if let Some(s) = trimmed.strip_prefix("function ") {
             (false, s)
@@ -3014,6 +3065,22 @@ fn parse_block(body_lines: &[(u32, String)]) -> Vec<Stmt> {
             }
         }
 
+        // Bare expression statement.  Recognised so finalize-scope
+        // `Mapping::set(...)` / `Mapping::remove(...)` calls --
+        // which would otherwise be silently dropped by the parser
+        // -- propagate to `execute_block` and surface as io_events
+        // with EventLogKind::Write.  The trailing semicolon is
+        // stripped so `eval_expr` sees a clean expression.
+        if trimmed.ends_with(';') {
+            let text = trimmed.trim_end_matches(';').trim().to_string();
+            if !text.is_empty() {
+                out.push(Stmt::ExprStmt {
+                    text,
+                    line: *line_num,
+                });
+            }
+        }
+
         i += 1;
     }
     out
@@ -3036,6 +3103,10 @@ struct CallTrace {
     sub_calls: Vec<SubCall>,
     /// Assertions executed in this call.
     asserts: Vec<EmittedAssert>,
+    /// IO events surfaced by the evaluator (hash-builtin calls,
+    /// `Mapping::*` ops in finalize scope).  Surfaced via
+    /// `register_special_event` in source order alongside asserts.
+    io_events: Vec<EmittedIoEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -3068,6 +3139,27 @@ struct EmittedAssert {
     line: u32,
 }
 
+/// An IO-shaped event surfaced by the structured evaluator.  Used
+/// for hash-builtin invocations (`BHP256::hash_to_field(x)`) and
+/// finalize-scope mapping ops (`Mapping::set/get/get_or_use`) so
+/// downstream tooling can reconstruct the on-chain state-mutation
+/// sequence and the data-dependency reads against opaque hash
+/// oracles from the trace alone.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct EmittedIoEvent {
+    /// EventLogKind discriminant (`Read` for reads, `Write` for
+    /// writes, kept abstract via `bool is_write` so the helper
+    /// stays free of the trace-types dependency).
+    is_write: bool,
+    /// Short metadata tag emitted as the event's `metadata` field
+    /// (e.g. `"LeoMappingSet"`, `"LeoBhpHash"`).
+    metadata: &'static str,
+    /// Verbatim source-level expression text (e.g.
+    /// `"Mapping::set(balances, receiver, updated)"`).
+    text: String,
+}
+
 /// Execute a Leo function with a given `(formal-name, value)` argument
 /// list.  Returns a `CallTrace` describing every event the emit pass
 /// should produce.
@@ -3079,6 +3171,7 @@ fn execute_leo_function(prog: &LeoProgram, func: &LeoFunc, args: &[(String, Valu
     let mut bindings: Vec<EmittedBinding> = Vec::new();
     let mut sub_calls: Vec<SubCall> = Vec::new();
     let mut asserts: Vec<EmittedAssert> = Vec::new();
+    let mut io_events: Vec<EmittedIoEvent> = Vec::new();
     let mut return_value: Value = Value::Unknown;
 
     execute_block(
@@ -3088,6 +3181,7 @@ fn execute_leo_function(prog: &LeoProgram, func: &LeoFunc, args: &[(String, Valu
         &mut bindings,
         &mut sub_calls,
         &mut asserts,
+        &mut io_events,
         &mut return_value,
     );
 
@@ -3106,6 +3200,7 @@ fn execute_leo_function(prog: &LeoProgram, func: &LeoFunc, args: &[(String, Valu
         bindings,
         sub_calls,
         asserts,
+        io_events,
     }
 }
 
@@ -3116,6 +3211,7 @@ fn execute_block(
     bindings: &mut Vec<EmittedBinding>,
     sub_calls: &mut Vec<SubCall>,
     asserts: &mut Vec<EmittedAssert>,
+    io_events: &mut Vec<EmittedIoEvent>,
     return_value: &mut Value,
 ) {
     for stmt in block {
@@ -3127,7 +3223,7 @@ fn execute_block(
                 line,
                 ..
             } => {
-                let value = eval_expr(prog, env, expr, sub_calls, bindings.len());
+                let value = eval_expr(prog, env, expr, sub_calls, io_events, bindings.len());
                 env.insert(name.clone(), value.clone());
                 bindings.push(EmittedBinding {
                     name: name.clone(),
@@ -3143,7 +3239,7 @@ fn execute_block(
                 // is updated post-execution from the final env so the
                 // step event surfaces the post-loop / post-assign
                 // value rather than the initial one.
-                let value = eval_expr(prog, env, expr, sub_calls, bindings.len());
+                let value = eval_expr(prog, env, expr, sub_calls, io_events, bindings.len());
                 env.insert(target.clone(), value);
             }
             Stmt::Assert { kind, text, line } => {
@@ -3163,15 +3259,31 @@ fn execute_block(
             } => {
                 for i in *lo..*hi {
                     env.insert(var.clone(), Value::Int(i, type_name.clone()));
-                    execute_block(prog, body, env, bindings, sub_calls, asserts, return_value);
+                    execute_block(
+                        prog,
+                        body,
+                        env,
+                        bindings,
+                        sub_calls,
+                        asserts,
+                        io_events,
+                        return_value,
+                    );
                 }
             }
             Stmt::Return { expr, .. } => {
-                let value = eval_expr(prog, env, expr, sub_calls, bindings.len());
+                let value = eval_expr(prog, env, expr, sub_calls, io_events, bindings.len());
                 *return_value = value;
                 return;
             }
-            Stmt::ExprStmt { .. } => {}
+            Stmt::ExprStmt { text, .. } => {
+                // Bare expression statements that ARE recognised as
+                // builtin call shapes (Mapping::set, hash builtins,
+                // etc.) need to be evaluated for their side
+                // effects.  Plain unrecognised expression statements
+                // are no-ops as before.
+                let _ = eval_expr(prog, env, text, sub_calls, io_events, bindings.len());
+            }
         }
     }
 }
@@ -3189,6 +3301,7 @@ fn eval_expr(
     env: &EvalEnv,
     expr: &str,
     sub_calls: &mut Vec<SubCall>,
+    io_events: &mut Vec<EmittedIoEvent>,
     after_binding: usize,
 ) -> Value {
     let expr = expr.trim();
@@ -3203,16 +3316,30 @@ fn eval_expr(
     if expr.starts_with('(') && expr.ends_with(')') && matched_outer_parens(expr) {
         let inside = &expr[1..expr.len() - 1];
         if find_top_level_char(inside, ',').is_none() {
-            return eval_expr(prog, env, inside, sub_calls, after_binding);
+            return eval_expr(prog, env, inside, sub_calls, io_events, after_binding);
         }
     }
 
     // Ternary: `cond ? a : b` -- the `?` and `:` must be at top level.
     if let Some(qpos) = find_top_level_char(expr, '?') {
         if let Some(cpos) = find_top_level_char_from(expr, ':', qpos + 1) {
-            let cond = eval_expr(prog, env, &expr[..qpos], sub_calls, after_binding);
-            let then_branch = eval_expr(prog, env, &expr[qpos + 1..cpos], sub_calls, after_binding);
-            let else_branch = eval_expr(prog, env, &expr[cpos + 1..], sub_calls, after_binding);
+            let cond = eval_expr(prog, env, &expr[..qpos], sub_calls, io_events, after_binding);
+            let then_branch = eval_expr(
+                prog,
+                env,
+                &expr[qpos + 1..cpos],
+                sub_calls,
+                io_events,
+                after_binding,
+            );
+            let else_branch = eval_expr(
+                prog,
+                env,
+                &expr[cpos + 1..],
+                sub_calls,
+                io_events,
+                after_binding,
+            );
             return if value_truthy(&cond) {
                 then_branch
             } else {
@@ -3224,11 +3351,25 @@ fn eval_expr(
     // `if cond { then } else { else }` expression.
     if let Some(rest) = expr.strip_prefix("if ") {
         if let Some(parsed) = parse_if_expr(rest) {
-            let cond = eval_expr(prog, env, &parsed.cond, sub_calls, after_binding);
+            let cond = eval_expr(prog, env, &parsed.cond, sub_calls, io_events, after_binding);
             return if value_truthy(&cond) {
-                eval_expr(prog, env, &parsed.then_branch, sub_calls, after_binding)
+                eval_expr(
+                    prog,
+                    env,
+                    &parsed.then_branch,
+                    sub_calls,
+                    io_events,
+                    after_binding,
+                )
             } else {
-                eval_expr(prog, env, &parsed.else_branch, sub_calls, after_binding)
+                eval_expr(
+                    prog,
+                    env,
+                    &parsed.else_branch,
+                    sub_calls,
+                    io_events,
+                    after_binding,
+                )
             };
         }
     }
@@ -3236,8 +3377,15 @@ fn eval_expr(
     // Top-level binary comparisons (lowest precedence after ternary).
     for op in &["==", "!=", "<=", ">=", "<", ">"] {
         if let Some(pos) = find_top_level_substr(expr, op) {
-            let lhs = eval_expr(prog, env, &expr[..pos], sub_calls, after_binding);
-            let rhs = eval_expr(prog, env, &expr[pos + op.len()..], sub_calls, after_binding);
+            let lhs = eval_expr(prog, env, &expr[..pos], sub_calls, io_events, after_binding);
+            let rhs = eval_expr(
+                prog,
+                env,
+                &expr[pos + op.len()..],
+                sub_calls,
+                io_events,
+                after_binding,
+            );
             let li = lhs.as_int();
             let ri = rhs.as_int();
             let r = match *op {
@@ -3259,8 +3407,8 @@ fn eval_expr(
             let left = expr[..pos].trim();
             let right = expr[pos + 1..].trim();
             if !left.is_empty() && !right.is_empty() {
-                let lv = eval_expr(prog, env, left, sub_calls, after_binding);
-                let rv = eval_expr(prog, env, right, sub_calls, after_binding);
+                let lv = eval_expr(prog, env, left, sub_calls, io_events, after_binding);
+                let rv = eval_expr(prog, env, right, sub_calls, io_events, after_binding);
                 let li = lv.as_int();
                 let ri = rv.as_int();
                 let r = if *op_char == '+' {
@@ -3283,8 +3431,8 @@ fn eval_expr(
             let left = expr[..pos].trim();
             let right = expr[pos + 1..].trim();
             if !left.is_empty() && !right.is_empty() {
-                let lv = eval_expr(prog, env, left, sub_calls, after_binding);
-                let rv = eval_expr(prog, env, right, sub_calls, after_binding);
+                let lv = eval_expr(prog, env, left, sub_calls, io_events, after_binding);
+                let rv = eval_expr(prog, env, right, sub_calls, io_events, after_binding);
                 let li = lv.as_int();
                 let ri = rv.as_int();
                 let r = match *op_char {
@@ -3321,7 +3469,7 @@ fn eval_expr(
         if parts.len() >= 2 {
             let elems: Vec<Value> = parts
                 .iter()
-                .map(|p| eval_expr(prog, env, p.trim(), sub_calls, after_binding))
+                .map(|p| eval_expr(prog, env, p.trim(), sub_calls, io_events, after_binding))
                 .collect();
             return Value::Tuple(elems);
         }
@@ -3331,7 +3479,7 @@ fn eval_expr(
         let parts = split_top_level_commas(inner);
         let elems: Vec<Value> = parts
             .iter()
-            .map(|p| eval_expr(prog, env, p.trim(), sub_calls, after_binding))
+            .map(|p| eval_expr(prog, env, p.trim(), sub_calls, io_events, after_binding))
             .collect();
         let elem_type = match elems.first() {
             Some(Value::Int(_, t)) => t.clone(),
@@ -3355,7 +3503,7 @@ fn eval_expr(
                 if let Some(colon) = p.find(':') {
                     let fname = p[..colon].trim().to_string();
                     let fexpr = p[colon + 1..].trim();
-                    let fv = eval_expr(prog, env, fexpr, sub_calls, after_binding);
+                    let fv = eval_expr(prog, env, fexpr, sub_calls, io_events, after_binding);
                     fields.push((fname, fv));
                 }
             }
@@ -3363,6 +3511,37 @@ fn eval_expr(
                 name: name.to_string(),
                 fields,
             };
+        }
+    }
+
+    // Builtin call: `Family::method(args...)`.  Covers Aleo's hash
+    // builtins (BHP / Pedersen / Poseidon / Keccak) and the
+    // `Mapping::*` finalize-scope ops.  Surfaces an io_event so
+    // downstream tooling can reconstruct hash invocations and
+    // mapping reads/writes from the trace alone.
+    if let Some(open) = expr.find('(') {
+        if expr.ends_with(')') {
+            let head = expr[..open].trim();
+            if let Some(dcolon) = head.find("::") {
+                let family = head[..dcolon].trim();
+                let method = head[dcolon + 2..].trim();
+                if !family.is_empty()
+                    && !method.is_empty()
+                    && family.chars().all(|c| c.is_alphanumeric() || c == '_')
+                    && method.chars().all(|c| c.is_alphanumeric() || c == '_')
+                {
+                    let inner = &expr[open + 1..expr.len() - 1];
+                    let arg_exprs = split_top_level_commas(inner);
+                    let arg_values: Vec<Value> = arg_exprs
+                        .iter()
+                        .map(|a| {
+                            eval_expr(prog, env, a.trim(), sub_calls, io_events, after_binding)
+                        })
+                        .collect();
+
+                    return eval_builtin_method(family, method, &arg_values, expr, io_events);
+                }
+            }
         }
     }
 
@@ -3378,7 +3557,7 @@ fn eval_expr(
             let arg_exprs = split_top_level_commas(inner);
             let arg_values: Vec<Value> = arg_exprs
                 .iter()
-                .map(|a| eval_expr(prog, env, a.trim(), sub_calls, after_binding))
+                .map(|a| eval_expr(prog, env, a.trim(), sub_calls, io_events, after_binding))
                 .collect();
 
             if let Some(callee) = prog.by_name.get(name) {
@@ -3410,7 +3589,7 @@ fn eval_expr(
     if let Some(dot) = find_top_level_char(expr, '.') {
         let base = expr[..dot].trim();
         let field = expr[dot + 1..].trim();
-        let base_v = eval_expr(prog, env, base, sub_calls, after_binding);
+        let base_v = eval_expr(prog, env, base, sub_calls, io_events, after_binding);
         return access_field(&base_v, field);
     }
 
@@ -3419,8 +3598,8 @@ fn eval_expr(
         if expr.ends_with(']') {
             let base = expr[..open].trim();
             let idx_text = &expr[open + 1..expr.len() - 1];
-            let base_v = eval_expr(prog, env, base, sub_calls, after_binding);
-            let idx_v = eval_expr(prog, env, idx_text, sub_calls, after_binding);
+            let base_v = eval_expr(prog, env, base, sub_calls, io_events, after_binding);
+            let idx_v = eval_expr(prog, env, idx_text, sub_calls, io_events, after_binding);
             if let Value::Sequence(elems, _) = &base_v {
                 let i = idx_v.as_int() as usize;
                 if let Some(v) = elems.get(i) {
@@ -3483,6 +3662,144 @@ fn access_field(base: &Value, field: &str) -> Value {
         }
         _ => Value::Unknown,
     }
+}
+
+/// Evaluate an Aleo builtin static-method call like
+/// `BHP256::hash_to_field(x)` or `Mapping::set(balances, k, v)`.
+///
+/// The hash builtins return a deterministic stand-in (sum of
+/// integer arg payloads, typed `field`) so the trace exercises the
+/// parsing + value-emission path without pretending to implement
+/// BLS12-377 BHP / Pedersen / Poseidon / Keccak.  Real curve-level
+/// hashing lives in snarkVM and is intentionally not modelled
+/// here.
+///
+/// Each invocation surfaces as an `EmittedIoEvent` so downstream
+/// tooling can reason about hash invocations as data-dependency
+/// reads against an opaque oracle, and about mapping ops as the
+/// canonical on-chain state-mutation events.
+fn eval_builtin_method(
+    family: &str,
+    method: &str,
+    args: &[Value],
+    expr_text: &str,
+    io_events: &mut Vec<EmittedIoEvent>,
+) -> Value {
+    // Mapping operations -- finalize-scope state I/O.
+    if family == "Mapping" {
+        match method {
+            "get" => {
+                io_events.push(EmittedIoEvent {
+                    is_write: false,
+                    metadata: "LeoMappingGet",
+                    text: expr_text.to_string(),
+                });
+                // `Mapping::get(map, key)` -- without an in-memory
+                // store the source-level evaluator returns 0 so
+                // downstream arithmetic stays well-defined.
+                return Value::Int(0, "u32".to_string());
+            }
+            "get_or_use" => {
+                io_events.push(EmittedIoEvent {
+                    is_write: false,
+                    metadata: "LeoMappingGetOrUse",
+                    text: expr_text.to_string(),
+                });
+                // The third arg is the default; surface it so
+                // arithmetic that depends on the get-or-use result
+                // matches the real-chain "no prior key" path.
+                let default = args.get(2).cloned().unwrap_or(Value::Unknown);
+                return default;
+            }
+            "set" => {
+                io_events.push(EmittedIoEvent {
+                    is_write: true,
+                    metadata: "LeoMappingSet",
+                    text: expr_text.to_string(),
+                });
+                return Value::Unknown;
+            }
+            "remove" => {
+                io_events.push(EmittedIoEvent {
+                    is_write: true,
+                    metadata: "LeoMappingRemove",
+                    text: expr_text.to_string(),
+                });
+                return Value::Unknown;
+            }
+            "contains" => {
+                io_events.push(EmittedIoEvent {
+                    is_write: false,
+                    metadata: "LeoMappingContains",
+                    text: expr_text.to_string(),
+                });
+                return Value::Bool(false);
+            }
+            _ => {}
+        }
+    }
+
+    // Hash builtins.  Family prefixes recognised by the recorder:
+    // BHP{256,512,768,1024}, Pedersen{64,128}, Poseidon{2,4,8},
+    // Keccak{256,384,512}, SHA3_{256,384,512}.  We treat any
+    // family whose prefix matches one of those buckets as a hash
+    // builtin and the method as the output kind
+    // (`hash_to_field`, `hash_to_group`, ...).
+    let family_kind = if family.starts_with("BHP") {
+        Some("BHP")
+    } else if family.starts_with("Pedersen") {
+        Some("Pedersen")
+    } else if family.starts_with("Poseidon") {
+        Some("Poseidon")
+    } else if family.starts_with("Keccak") {
+        Some("Keccak")
+    } else if family.starts_with("SHA3") {
+        Some("SHA3")
+    } else {
+        None
+    };
+    if let Some(kind) = family_kind {
+        if method.starts_with("hash_to_")
+            || method.starts_with("commit_to_")
+            || method == "hash"
+            || method == "commit"
+        {
+            // Deterministic stub: sum the integer payloads.  Type
+            // is derived from the method's `hash_to_<type>` suffix
+            // when available; otherwise defaults to `field`.
+            let out_type = if let Some(suffix) = method.strip_prefix("hash_to_") {
+                suffix.to_string()
+            } else if let Some(suffix) = method.strip_prefix("commit_to_") {
+                suffix.to_string()
+            } else {
+                "field".to_string()
+            };
+            let sum: i64 = args.iter().map(|a| a.as_int()).sum();
+            let metadata = match kind {
+                "BHP" => "LeoBhpHash",
+                "Pedersen" => "LeoPedersenHash",
+                "Poseidon" => "LeoPoseidonHash",
+                "Keccak" => "LeoKeccakHash",
+                "SHA3" => "LeoSha3Hash",
+                _ => "LeoHash",
+            };
+            io_events.push(EmittedIoEvent {
+                is_write: false,
+                metadata,
+                text: expr_text.to_string(),
+            });
+            return Value::Int(sum, out_type);
+        }
+    }
+
+    // Unknown builtin -- emit a tagged read so it doesn't silently
+    // disappear from the trace, then return Unknown.
+    io_events.push(EmittedIoEvent {
+        is_write: false,
+        metadata: "LeoUnknownBuiltin",
+        text: expr_text.to_string(),
+    });
+    Value::Unknown
 }
 
 struct IfExpr {

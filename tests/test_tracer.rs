@@ -1228,3 +1228,575 @@ fn test_assert_test_emits_assert_events() {
         "expected exactly 2 io_events (one per assert call); counts={counts}"
     );
 }
+
+// ===========================================================================
+// M11 fixtures — top-5 priority Aleo coverage gap
+// ===========================================================================
+//
+// These tests pin the recorder's behaviour on the five fixtures that
+// the M11 plan calls out as the priority Aleo coverage gap:
+//
+//   1. multi_function_test.leo   — 3-deep helper chain
+//   2. field_group_scalar_arith_test.leo — native curve types
+//   3. hash_builtins_test.leo    — BHP / Pedersen / Poseidon / Keccak
+//   4. mapping_finalize_test.leo — async finalize + Mapping::* ops
+//   5. record_token_test.leo     — UTXO record lifecycle
+//
+// The structured evaluator handles control flow, struct/tuple/array
+// literals, argumentful calls, hash-builtin static-method shapes
+// (`Family::method(args)`), `Mapping::*` finalize-scope ops, and
+// the `record` keyword as a struct-shaped UTXO primitive.  Real
+// curve math (BLS12-377 BHP / Pedersen / Poseidon / Keccak) lives
+// in snarkVM and is not modelled by the source-level evaluator --
+// hash builtins return a deterministic stand-in (sum of integer
+// arg payloads, typed `field`) so the trace exercises the
+// parsing + value-emission path without faking BLS12-377.
+
+// --- multi_function_test.leo ----------------------------------------------
+
+/// Records `multi_function_test.leo` and pins the full event shape
+/// of the 3-deep helper chain (`main -> outer -> middle -> inner`).
+///
+/// The structured evaluator threads each callee's argument values
+/// through formal-parameter binding, propagates the inner-most
+/// return value back up the chain, and surfaces every
+/// let-binding in per-call source order.
+#[test]
+fn test_multi_function_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_multi_function_test_via_ct_print_full",
+        "multi_function_test.leo",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["main", "outer", "middle", "inner"]);
+
+    // Counts: per-call-entry parameter step + per-binding step.
+    //   Top-level absolute step: 1
+    //   outer: entry-step(z=7), m_v binding step, o binding step, return-step = 4
+    //   middle: entry-step(v=4), inner_val binding step, m binding step, return-step = 4
+    //   inner: entry-step(x=2,y=3 dual), s binding step, bumped binding step, return-step = 4
+    //   main return-step = 1
+    // Total step events = 14.
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(14), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(3), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    assert_step_indices_monotonic(&doc);
+
+    // Call-entry order is outer-then-middle-then-inner; exits are
+    // reverse (inner-first) since each callee finishes before its
+    // parent's binding step is completed.
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "outer".to_string(),
+            "middle".to_string(),
+            "inner".to_string()
+        ]
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    let exit_sequence: Vec<&str> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .filter_map(|e| e["function"].as_str())
+        .collect();
+    assert_eq!(exit_sequence, vec!["inner", "middle", "outer"]);
+
+    // Every step variable is a u32 Int; the emitted sequence interleaves
+    // formal-parameter steps and per-binding steps.  Each formal parameter
+    // surfaces twice (once at the function-entry step that anchors
+    // the call_entry, once at the variable step) for `z` and `v` -- the
+    // 2-arg `inner` chain emits the two formals once per step.
+    assert_eq!(
+        observed_var_sequence(&doc),
+        vec![
+            ("z".to_string(), 7),
+            ("z".to_string(), 7),
+            ("v".to_string(), 4),
+            ("v".to_string(), 4),
+            ("x".to_string(), 2),
+            ("y".to_string(), 3),
+            ("x".to_string(), 2),
+            ("y".to_string(), 3),
+            ("s".to_string(), 5),
+            ("bumped".to_string(), 6),
+            ("inner_val".to_string(), 6),
+            ("m".to_string(), 10),
+            ("middle_val".to_string(), 10),
+            ("o".to_string(), 15),
+        ]
+    );
+
+    // Return values: inner returns 6, middle 10, outer 15.
+    let returns: Vec<(String, i64)> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let name = e["function"].as_str().expect("function").to_string();
+            let rv = &e["return_value"];
+            assert_eq!(
+                rv["kind"].as_str(),
+                Some("Int"),
+                "return value should decode as Int; got {rv}"
+            );
+            (name, rv["i"].as_i64().expect("Int.i"))
+        })
+        .collect();
+    assert_eq!(
+        returns,
+        vec![
+            ("inner".to_string(), 6),
+            ("middle".to_string(), 10),
+            ("outer".to_string(), 15),
+        ]
+    );
+}
+
+// --- field_group_scalar_arith_test.leo ------------------------------------
+
+/// Records `field_group_scalar_arith_test.leo` and pins the full
+/// event shape for Leo's native curve types (`field` / `scalar`).
+/// `parse_typed_literal` recognises the suffix; the evaluator
+/// surfaces each binding as a `ValueRecord::Int` carrying the
+/// suffix as the type name, so downstream tooling can distinguish
+/// `field` from `u32` even though both decode as `Int` payloads
+/// in the trace today (real curve math lives in snarkVM).
+#[test]
+fn test_field_group_scalar_arith_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_field_group_scalar_arith_test_via_ct_print_full",
+        "field_group_scalar_arith_test.leo",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["main", "compute"]);
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(11), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    assert_step_indices_monotonic(&doc);
+    assert_eq!(observed_call_sequence(&doc), vec!["compute".to_string()]);
+
+    // f1=5, f2=7, f_sum=12 (field arithmetic), s1=3, s2=4, s_sum=7
+    // (scalar arithmetic), total=19 (u32).  All payloads decode as
+    // `Int` -- the type discrimination lives in the registered
+    // `types` array (which contains `field`, `group`, `scalar`).
+    assert_eq!(
+        observed_var_sequence(&doc),
+        vec![
+            ("f1".to_string(), 5),
+            ("f2".to_string(), 7),
+            ("f_sum".to_string(), 12),
+            ("s1".to_string(), 3),
+            ("s2".to_string(), 4),
+            ("s_sum".to_string(), 7),
+            ("total".to_string(), 19),
+        ]
+    );
+
+    // The native curve type `field` and `scalar` must surface in
+    // the registered types table so downstream tooling can
+    // distinguish them from u32.  `group` is not used in this
+    // fixture but is recognised by `parse_typed_literal`.
+    let types: Vec<&str> = doc["types"]
+        .as_array()
+        .expect("types array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        types.contains(&"field"),
+        "expected `field` in registered types; got {types:?}"
+    );
+    assert!(
+        types.contains(&"scalar"),
+        "expected `scalar` in registered types; got {types:?}"
+    );
+}
+
+// --- hash_builtins_test.leo ----------------------------------------------
+
+/// Records `hash_builtins_test.leo` and pins the io_event count at
+/// EXACTLY 4 -- one per hash-builtin invocation
+/// (BHP/Pedersen/Poseidon/Keccak).  The hash stub in
+/// `eval_builtin_method` returns a deterministic stand-in (sum of
+/// integer arg payloads, typed `field`) so each binding round-trips
+/// as an `Int` value record.  Each invocation surfaces an io_event
+/// of `EventLogKind::Read` with a family-tagged metadata
+/// (`LeoBhpHash` / `LeoPedersenHash` / `LeoPoseidonHash` /
+/// `LeoKeccakHash`) and verbatim source-level call text.
+#[test]
+fn test_hash_builtins_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_hash_builtins_test_via_ct_print_full",
+        "hash_builtins_test.leo",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["main", "compute"]);
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(9), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(4),
+        "io_events; counts={counts}"
+    );
+
+    assert_step_indices_monotonic(&doc);
+    assert_eq!(observed_call_sequence(&doc), vec!["compute".to_string()]);
+
+    // Each hash stub returns sum-of-args (single u32 arg => the
+    // arg's value): BHP256(1u32) -> 1, Pedersen64(2u32) -> 2,
+    // Poseidon4(3u32) -> 3, Keccak256(4u32) -> 4.  The literal
+    // `total` binds the canonical sum 10.
+    assert_eq!(
+        observed_var_sequence(&doc),
+        vec![
+            ("bhp_h".to_string(), 1),
+            ("ped_h".to_string(), 2),
+            ("pos_h".to_string(), 3),
+            ("kec_h".to_string(), 4),
+            ("total".to_string(), 10),
+        ]
+    );
+
+    // io_events: one per hash-family call, in source order.  Each
+    // surfaces as `ioFileOp` (the io_kind ct-print emits for
+    // EventLogKind::Read) and carries the verbatim source-level
+    // call text.  The family-specific metadata
+    // (`LeoBhpHash` / `LeoPedersenHash` / ...) is registered with
+    // the writer but not exposed via ct-print --full's JSON
+    // schema, so we pin only the visible (io_kind, text) pair.
+    let events = doc["events"].as_array().expect("events array");
+    let io_events: Vec<(String, String)> = events
+        .iter()
+        .filter(|e| e["kind"] == "io")
+        .map(|e| {
+            let io_kind = e["io_kind"].as_str().unwrap_or("").to_string();
+            let text = e["text"].as_str().unwrap_or("").to_string();
+            (io_kind, text)
+        })
+        .collect();
+    assert_eq!(
+        io_events,
+        vec![
+            (
+                "ioFileOp".to_string(),
+                "BHP256::hash_to_field(1u32)".to_string()
+            ),
+            (
+                "ioFileOp".to_string(),
+                "Pedersen64::hash_to_field(2u32)".to_string()
+            ),
+            (
+                "ioFileOp".to_string(),
+                "Poseidon4::hash_to_field(3u32)".to_string()
+            ),
+            (
+                "ioFileOp".to_string(),
+                "Keccak256::hash_to_field(4u32)".to_string()
+            ),
+        ]
+    );
+}
+
+// --- mapping_finalize_test.leo --------------------------------------------
+
+/// Records `mapping_finalize_test.leo` and pins the full event
+/// shape for `async transition` / `async function` plus the
+/// `Mapping::*` finalize-scope ops.  Each `Mapping::get_or_use`
+/// surfaces as an io_event with `EventLogKind::Read`; each
+/// `Mapping::set` surfaces as an io_event with
+/// `EventLogKind::Write`.
+#[test]
+fn test_mapping_finalize_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_mapping_finalize_test_via_ct_print_full",
+        "mapping_finalize_test.leo",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["main", "mint", "finalize_mint"]);
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(11), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(2),
+        "io_events; counts={counts}"
+    );
+
+    assert_step_indices_monotonic(&doc);
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["mint".to_string(), "finalize_mint".to_string()]
+    );
+
+    // mint(receiver=7, amount=10) returns reported=10.
+    // finalize_mint(receiver=7, amount=10):
+    //   prior = Mapping::get_or_use(balances, 7, 0u32) -> 0
+    //   updated = prior + amount = 10
+    //   Mapping::set(balances, 7, 10)
+    //   return updated = 10
+    assert_eq!(
+        observed_var_sequence(&doc),
+        vec![
+            ("receiver".to_string(), 7),
+            ("amount".to_string(), 10),
+            ("receiver".to_string(), 7),
+            ("amount".to_string(), 10),
+            ("reported".to_string(), 10),
+            ("minted".to_string(), 10),
+            ("receiver".to_string(), 7),
+            ("amount".to_string(), 10),
+            ("receiver".to_string(), 7),
+            ("amount".to_string(), 10),
+            ("prior".to_string(), 0),
+            ("updated".to_string(), 10),
+            ("finalized".to_string(), 10),
+        ]
+    );
+
+    // io_events: one Read for `Mapping::get_or_use`, one Write
+    // for `Mapping::set`, in source order.  ct-print --full
+    // surfaces these as `ioFileOp` (Read) and `ioStdout` (Write)
+    // respectively -- the Read/Write distinction is what
+    // downstream tooling needs to reconstruct the on-chain
+    // state-mutation sequence.  The op-specific metadata
+    // (`LeoMappingGetOrUse` / `LeoMappingSet`) is registered with
+    // the writer but not exposed via ct-print --full's JSON
+    // schema, so we pin only the visible (io_kind, text) pair.
+    let events = doc["events"].as_array().expect("events array");
+    let io_events: Vec<(String, String)> = events
+        .iter()
+        .filter(|e| e["kind"] == "io")
+        .map(|e| {
+            let io_kind = e["io_kind"].as_str().unwrap_or("").to_string();
+            let text = e["text"].as_str().unwrap_or("").to_string();
+            (io_kind, text)
+        })
+        .collect();
+    assert_eq!(
+        io_events,
+        vec![
+            (
+                "ioFileOp".to_string(),
+                "Mapping::get_or_use(balances, receiver, 0u32)".to_string()
+            ),
+            (
+                "ioStdout".to_string(),
+                "Mapping::set(balances, receiver, updated)".to_string()
+            ),
+        ]
+    );
+}
+
+// --- record_token_test.leo ------------------------------------------------
+
+/// Records `record_token_test.leo` and pins the full event shape
+/// for the UTXO `record` lifecycle (mint / transfer / burn).  The
+/// recorder treats `record` as a struct-shaped value and surfaces
+/// each lifecycle transition as a regular call_entry/call_exit
+/// pair with the produced record value flowing through the
+/// call's return value as a `ValueRecord::Struct`.
+#[test]
+fn test_record_token_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_record_token_test_via_ct_print_full",
+        "record_token_test.leo",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec!["main", "compute", "mint", "transfer", "burn"]
+    );
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(18), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(4), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    assert_step_indices_monotonic(&doc);
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "compute".to_string(),
+            "mint".to_string(),
+            "transfer".to_string(),
+            "burn".to_string()
+        ]
+    );
+
+    // The `record Token` decl registers as a struct-shaped type so
+    // mint/transfer return values surface as `ValueRecord::Struct`.
+    let types: Vec<&str> = doc["types"]
+        .as_array()
+        .expect("types array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        types.contains(&"Token"),
+        "expected `Token` record in registered types; got {types:?}"
+    );
+
+    // ----- Per-call returns ----------------------------------------------
+    // mint -> Token { owner: 99, amount: 100 } as Struct
+    // transfer -> Token { owner: 200, amount: 80 } as Struct
+    // burn -> 80 as Int
+    // compute -> 80 as Int
+    let events = doc["events"].as_array().expect("events array");
+    let returns: Vec<(String, &serde_json::Value)> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            (
+                e["function"].as_str().expect("function").to_string(),
+                &e["return_value"],
+            )
+        })
+        .collect();
+    assert_eq!(returns.len(), 4);
+
+    let (mint_name, mint_rv) = &returns[0];
+    assert_eq!(mint_name, "mint");
+    assert_eq!(mint_rv["kind"].as_str(), Some("Struct"));
+    let mint_fields: Vec<i64> = mint_rv["field_values"]
+        .as_array()
+        .expect("field_values array")
+        .iter()
+        .map(|f| f["i"].as_i64().expect("Int.i"))
+        .collect();
+    assert_eq!(mint_fields, vec![99, 100]);
+
+    let (transfer_name, transfer_rv) = &returns[1];
+    assert_eq!(transfer_name, "transfer");
+    assert_eq!(transfer_rv["kind"].as_str(), Some("Struct"));
+    let transfer_fields: Vec<i64> = transfer_rv["field_values"]
+        .as_array()
+        .expect("field_values array")
+        .iter()
+        .map(|f| f["i"].as_i64().expect("Int.i"))
+        .collect();
+    assert_eq!(transfer_fields, vec![200, 80]);
+
+    let (burn_name, burn_rv) = &returns[2];
+    assert_eq!(burn_name, "burn");
+    assert_eq!(burn_rv["kind"].as_str(), Some("Int"));
+    assert_eq!(burn_rv["i"].as_i64(), Some(80));
+
+    let (compute_name, compute_rv) = &returns[3];
+    assert_eq!(compute_name, "compute");
+    assert_eq!(compute_rv["kind"].as_str(), Some("Int"));
+    assert_eq!(compute_rv["i"].as_i64(), Some(80));
+
+    // ----- Decoded Int variable sequence (only Int bindings, in order)
+    // The struct-typed bindings (`minted`, `initial`, `new_token`,
+    // `moved`, plus the `input: Token` formal parameter) are
+    // skipped by `int_only_var_sequence` so the int-only chain
+    // stays readable.  `input` appears multiple times because
+    // each call's parameter binding emits twice (once at the
+    // function-entry step, once at the per-formal step).
+    let int_vars: Vec<(String, i64)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .filter_map(|v| {
+            let name = v["varname"].as_str()?.to_string();
+            if v["value"]["kind"].as_str() == Some("Int") {
+                Some((name, v["value"]["i"].as_i64().unwrap_or_default()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        int_vars,
+        vec![
+            ("owner".to_string(), 99),
+            ("amount".to_string(), 100),
+            ("owner".to_string(), 99),
+            ("amount".to_string(), 100),
+            ("receiver".to_string(), 200),
+            ("send".to_string(), 80),
+            ("receiver".to_string(), 200),
+            ("send".to_string(), 80),
+            ("leftover".to_string(), 20),
+            ("_residual".to_string(), 20),
+            ("consumed".to_string(), 80),
+            ("burnt".to_string(), 80),
+        ]
+    );
+}
