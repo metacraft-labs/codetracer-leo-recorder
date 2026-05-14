@@ -433,7 +433,61 @@ impl LeoTracer {
         _variable_values: &HashMap<String, i64>,
         _aleo_source_map: &AleoSourceMap,
     ) -> Result<()> {
-        let prog = parse_leo_program(source_code);
+        let mut prog = parse_leo_program(source_code);
+
+        // Per-function source path: defaults to the caller's
+        // `source_path` for every function declared in the main
+        // file.  When the recorder loads an imported `.leo` file
+        // (via `import X.aleo;`), each imported function is
+        // re-tagged with the imported file's path so source-line
+        // metadata for cross-program calls correctly points at
+        // the library file rather than the caller.
+        let mut func_source_files: HashMap<String, std::path::PathBuf> = HashMap::new();
+        for f in &prog.funcs {
+            func_source_files.insert(f.name.clone(), source_path.to_path_buf());
+        }
+
+        // Resolve `import X.aleo;` directives by loading sibling
+        // `.leo` files from the caller's directory and merging
+        // their function tables / struct decls into the main
+        // program.  Each imported function is tagged with the
+        // imported file's path so the writer registers a distinct
+        // function-id pointing at the library source.
+        let imports = collect_imports(source_code);
+        for import_name in &imports {
+            let import_path = source_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(format!("{import_name}.leo"));
+            if !import_path.exists() {
+                eprintln!(
+                    "Imported program {import_name} not found at {}; skipping",
+                    import_path.display()
+                );
+                continue;
+            }
+            let imported_src = match std::fs::read_to_string(&import_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "Failed to read imported program {}: {e}; skipping",
+                        import_path.display()
+                    );
+                    continue;
+                }
+            };
+            let imported_prog = parse_leo_program(&imported_src);
+            for f in imported_prog.funcs {
+                func_source_files.insert(f.name.clone(), import_path.clone());
+                if !prog.by_name.contains_key(&f.name) {
+                    prog.by_name.insert(f.name.clone(), f.clone());
+                }
+                prog.funcs.push(f);
+            }
+            for (name, def) in imported_prog.structs {
+                prog.structs.entry(name).or_insert(def);
+            }
+        }
 
         // The structured parser is the source of truth.  Register
         // every declared struct as a typed record so
@@ -477,14 +531,16 @@ impl LeoTracer {
 
         // Execute and emit from `main` via the structured evaluator.
         if let Some(main_fn) = prog.by_name.get("main") {
-            let trace = execute_leo_function(&prog, main_fn, &[]);
+            let main_fn_clone = main_fn.clone();
+            let trace = execute_leo_function(&prog, &main_fn_clone, &[]);
             self.emit_call_trace(
                 source_path,
-                main_fn,
+                &main_fn_clone,
                 &trace,
                 &[],
                 &prog,
                 &struct_type_ids,
+                &func_source_files,
                 /*is_entry_point=*/ true,
             );
         } else {
@@ -542,12 +598,33 @@ impl LeoTracer {
         call_args: &[(String, Value)],
         prog: &LeoProgram,
         struct_type_ids: &HashMap<String, codetracer_trace_types::TypeId>,
+        func_source_files: &HashMap<String, std::path::PathBuf>,
         is_entry_point: bool,
     ) {
+        // Functions imported from sibling .leo files have their own
+        // source path so the writer registers a distinct
+        // function-id pointing at the library file rather than the
+        // caller's source path.  Falls back to the caller's path
+        // for top-level / non-imported functions.
+        let func_path: std::path::PathBuf = func_source_files
+            .get(&func.name)
+            .cloned()
+            .unwrap_or_else(|| source_path.to_path_buf());
+        // For functions declared inside an imported program, surface
+        // the qualified name (`math_lib.aleo/double`) in the
+        // function table so cross-program calls are unambiguous;
+        // local functions keep their bare name.
+        let qualified_name: String = match (&func.program_name, func_source_files.get(&func.name)) {
+            // Function comes from an imported file (different source path).
+            (Some(prog_name), Some(p)) if p.as_path() != source_path => {
+                format!("{prog_name}.aleo/{}", func.name)
+            }
+            _ => func.name.clone(),
+        };
         let fn_id = TraceWriter::ensure_function_id(
             &mut *self.writer,
-            &func.name,
-            source_path,
+            &qualified_name,
+            &func_path,
             Line(func.line as i64),
         );
         if !is_entry_point {
@@ -568,7 +645,7 @@ impl LeoTracer {
             // `register_variable_with_full_value` calls below so
             // structured arguments (Tuple/Struct/Sequence) actually
             // surface in the variable stream.
-            TraceWriter::register_step(&mut *self.writer, source_path, Line(func.line as i64));
+            TraceWriter::register_step(&mut *self.writer, &func_path, Line(func.line as i64));
             // Re-emit each formal parameter as a step variable so the
             // structured argument value (Tuple `(10, 20)` for
             // `sum_pair(p)`, Struct `{x:3,y:4}` for
@@ -603,14 +680,18 @@ impl LeoTracer {
                         &sub.args,
                         prog,
                         struct_type_ids,
+                        func_source_files,
                         false,
                     );
                 }
                 sub_idx += 1;
             }
 
-            // Emit step + variable for this binding.
-            TraceWriter::register_step(&mut *self.writer, source_path, Line(binding.line as i64));
+            // Emit step + variable for this binding.  Use the
+            // function's own source path so cross-program calls
+            // surface step events against the library's source
+            // file rather than the caller's.
+            TraceWriter::register_step(&mut *self.writer, &func_path, Line(binding.line as i64));
             let record = self.value_to_record(&binding.value, struct_type_ids);
             TraceWriter::register_variable_with_full_value(
                 &mut *self.writer,
@@ -631,6 +712,7 @@ impl LeoTracer {
                     &sub.args,
                     prog,
                     struct_type_ids,
+                    func_source_files,
                     false,
                 );
             }
@@ -657,10 +739,16 @@ impl LeoTracer {
         // mapping ops surfaced by the structured evaluator.  Reads
         // (`Mapping::get*`, hash-builtin evaluations) carry
         // EventLogKind::Read; writes (`Mapping::set/remove`)
-        // carry EventLogKind::Write.  Each event's `text` field
-        // round-trips the verbatim source-level expression.
+        // carry EventLogKind::Write; aborts (`LeoFinalizeAbort`,
+        // `LeoOverflow` -- though the latter is non-fatal) carry
+        // EventLogKind::Error so downstream tooling can
+        // distinguish chain-failing events from successful state
+        // I/O.  Each event's `text` field round-trips the verbatim
+        // source-level expression.
         for e in &trace.io_events {
-            let kind = if e.is_write {
+            let kind = if e.metadata == "LeoFinalizeAbort" {
+                EventLogKind::Error
+            } else if e.is_write {
                 EventLogKind::Write
             } else {
                 EventLogKind::Read
@@ -671,7 +759,7 @@ impl LeoTracer {
         // Emit the return-statement step (so the line of the `return`
         // shows up in the trace, matching the legacy AVM emit shape).
         let return_line = find_return_line_in_body(&func.body).unwrap_or(func.body_end_line);
-        TraceWriter::register_step(&mut *self.writer, source_path, Line(return_line as i64));
+        TraceWriter::register_step(&mut *self.writer, &func_path, Line(return_line as i64));
 
         if !is_entry_point {
             let record = self.value_to_record(&trace.return_value, struct_type_ids);
@@ -694,6 +782,24 @@ impl LeoTracer {
             Value::Bool(b) => {
                 let type_id = self.ensure_int_type("bool");
                 ValueRecord::Bool { b: *b, type_id }
+            }
+            Value::Str(text, type_name) => {
+                // Register a `TypeKind::String` id for the address /
+                // string-shaped payload so downstream tooling can
+                // distinguish it from `u32` (the catch-all integer
+                // type) via `type_id`.
+                let type_id = if let Some(id) = self.type_ids.get(type_name) {
+                    *id
+                } else {
+                    let id =
+                        TraceWriter::ensure_type_id(&mut *self.writer, TypeKind::String, type_name);
+                    self.type_ids.insert(type_name.clone(), id);
+                    id
+                };
+                ValueRecord::String {
+                    text: text.clone(),
+                    type_id,
+                }
             }
             Value::Sequence(elems, elem_type) => {
                 let elements: Vec<ValueRecord> = elems
@@ -2472,6 +2578,12 @@ struct LeoFunc {
     /// Free-form return type, captured for completeness; unused by the
     /// evaluator today.
     return_type: Option<String>,
+    /// The Aleo program this function belongs to (e.g. `"math_lib"`
+    /// for a function declared inside `program math_lib.aleo {...}`).
+    /// Used to surface qualified function names
+    /// (`math_lib.aleo/double`) in the writer's function table when
+    /// the recorder loads multiple .leo files via `import`.
+    program_name: Option<String>,
 }
 
 /// A Leo struct definition (`struct Name { field: type, ... }`).
@@ -2490,6 +2602,12 @@ struct LeoStructDef {
 enum Value {
     Int(i64, String),
     Bool(bool),
+    /// A typed string value -- used for Aleo `address` payloads
+    /// surfaced by the call-context builtins (`self.caller`,
+    /// `self.signer`).  Carries the lang-level type name (e.g.
+    /// `"address"`) so `value_to_record` can register the right
+    /// `TypeKind::String` id.
+    Str(String, String),
     Sequence(Vec<Value>, String),
     Tuple(Vec<Value>),
     Struct {
@@ -2538,15 +2656,57 @@ struct LeoProgram {
 // Structured Leo parser
 // ---------------------------------------------------------------------------
 
+/// Scan a Leo source file for `import X.aleo;` directives and
+/// return the bare program names (e.g. `["math_lib"]`).  The
+/// recorder uses these to load sibling `.leo` files from the
+/// caller's directory and merge them into the structured
+/// program.
+fn collect_imports(source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("import ") {
+            let rest = rest.trim().trim_end_matches(';').trim();
+            if let Some(name) = rest.strip_suffix(".aleo") {
+                let bare = name.trim();
+                if !bare.is_empty() {
+                    out.push(bare.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Parse a Leo source file into a `LeoProgram` (functions + structs).
 fn parse_leo_program(source: &str) -> LeoProgram {
     let lines: Vec<&str> = source.lines().collect();
     let mut structs: HashMap<String, LeoStructDef> = HashMap::new();
     let mut funcs: Vec<LeoFunc> = Vec::new();
+    // Tracks the most recent `program X.aleo { ... }` header so each
+    // function declared inside it can be tagged with the qualifying
+    // program name -- needed to surface qualified function names
+    // (`math_lib.aleo/double`) when the recorder loads multiple
+    // .leo files via `import`.
+    let mut current_program: Option<String> = None;
 
     let mut i = 0;
     while i < lines.len() {
         let trimmed = lines[i].trim();
+
+        // `program X.aleo {` header -- record so subsequent function
+        // declarations inherit the program qualifier.
+        if let Some(rest) = trimmed.strip_prefix("program ") {
+            let rest = rest.trim();
+            if let Some(stripped) = rest.strip_suffix("{") {
+                let bare = stripped.trim();
+                if let Some(name) = bare.strip_suffix(".aleo") {
+                    current_program = Some(name.trim().to_string());
+                }
+            } else if let Some(name) = rest.strip_suffix(".aleo") {
+                current_program = Some(name.trim().to_string());
+            }
+        }
 
         // Struct or record declaration.  Aleo's `record` keyword is
         // a struct-shaped UTXO primitive: `record Token { owner:
@@ -2760,6 +2920,7 @@ fn parse_leo_program(source: &str) -> LeoProgram {
                 parameters,
                 body,
                 return_type,
+                program_name: current_program.clone(),
             });
         }
         i = m + 1;
@@ -3107,6 +3268,13 @@ struct CallTrace {
     /// `Mapping::*` ops in finalize scope).  Surfaced via
     /// `register_special_event` in source order alongside asserts.
     io_events: Vec<EmittedIoEvent>,
+    /// Whether the function aborted mid-execution (e.g. a
+    /// `Mapping::get` on a non-existent key in a finalize block).
+    /// When `true`, the emit pass writes `NONE_VALUE` as the return
+    /// payload so the CloseFrame surfaces as a failed-frame
+    /// CallRecord matching the on-chain finalize-abort semantics.
+    #[allow(dead_code)]
+    aborted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3173,6 +3341,7 @@ fn execute_leo_function(prog: &LeoProgram, func: &LeoFunc, args: &[(String, Valu
     let mut asserts: Vec<EmittedAssert> = Vec::new();
     let mut io_events: Vec<EmittedIoEvent> = Vec::new();
     let mut return_value: Value = Value::Unknown;
+    let mut aborted = false;
 
     execute_block(
         prog,
@@ -3183,6 +3352,7 @@ fn execute_leo_function(prog: &LeoProgram, func: &LeoFunc, args: &[(String, Valu
         &mut asserts,
         &mut io_events,
         &mut return_value,
+        &mut aborted,
     );
 
     // Post-execution sync: for each Let binding, replace its value
@@ -3195,12 +3365,23 @@ fn execute_leo_function(prog: &LeoProgram, func: &LeoFunc, args: &[(String, Valu
         }
     }
 
+    // If the function aborted (e.g. `Mapping::get` on a non-existent
+    // key in a finalize block), the return value is forced to
+    // `Unknown` so the emit pass writes `NONE_VALUE` -- the
+    // CloseFrame on the wire then surfaces as a failed-frame
+    // CallRecord with no return payload, matching the on-chain
+    // finalize-abort semantics.
+    if aborted {
+        return_value = Value::Unknown;
+    }
+
     CallTrace {
         return_value,
         bindings,
         sub_calls,
         asserts,
         io_events,
+        aborted,
     }
 }
 
@@ -3213,8 +3394,12 @@ fn execute_block(
     asserts: &mut Vec<EmittedAssert>,
     io_events: &mut Vec<EmittedIoEvent>,
     return_value: &mut Value,
+    aborted: &mut bool,
 ) {
     for stmt in block {
+        if *aborted {
+            return;
+        }
         match stmt {
             Stmt::Let {
                 name,
@@ -3223,7 +3408,17 @@ fn execute_block(
                 line,
                 ..
             } => {
+                let io_count_before = io_events.len();
                 let value = eval_expr(prog, env, expr, sub_calls, io_events, bindings.len());
+                // Detect a finalize abort surfaced by the evaluator
+                // (e.g. `Mapping::get` on a non-existent key).  We
+                // still push the binding so the abort site is
+                // attributed to the correct source line, but mark
+                // `aborted` so subsequent statements are skipped and
+                // the call's return value is forced to Unknown.
+                let abort_emitted = io_events[io_count_before..]
+                    .iter()
+                    .any(|e| e.metadata == "LeoFinalizeAbort");
                 env.insert(name.clone(), value.clone());
                 bindings.push(EmittedBinding {
                     name: name.clone(),
@@ -3231,6 +3426,10 @@ fn execute_block(
                     line: *line,
                     value,
                 });
+                if abort_emitted {
+                    *aborted = true;
+                    return;
+                }
             }
             Stmt::Assign { target, expr, .. } => {
                 // Update env in place; do NOT push a fresh emitted
@@ -3258,6 +3457,9 @@ fn execute_block(
                 ..
             } => {
                 for i in *lo..*hi {
+                    if *aborted {
+                        return;
+                    }
                     env.insert(var.clone(), Value::Int(i, type_name.clone()));
                     execute_block(
                         prog,
@@ -3268,6 +3470,7 @@ fn execute_block(
                         asserts,
                         io_events,
                         return_value,
+                        aborted,
                     );
                 }
             }
@@ -3282,7 +3485,15 @@ fn execute_block(
                 // etc.) need to be evaluated for their side
                 // effects.  Plain unrecognised expression statements
                 // are no-ops as before.
+                let io_count_before = io_events.len();
                 let _ = eval_expr(prog, env, text, sub_calls, io_events, bindings.len());
+                let abort_emitted = io_events[io_count_before..]
+                    .iter()
+                    .any(|e| e.metadata == "LeoFinalizeAbort");
+                if abort_emitted {
+                    *aborted = true;
+                    return;
+                }
             }
         }
     }
@@ -3320,10 +3531,41 @@ fn eval_expr(
         }
     }
 
+    // Aleo call-context built-ins.  `self.caller` / `self.signer`
+    // surface as bech32m address strings (deterministic stand-in
+    // literals so the trace doesn't depend on a real signing
+    // key); `block.height` surfaces as a typed `u32` so finalize-
+    // scope arithmetic on the chain height stays well-defined.
+    // These are recognised before generic dot-access so the
+    // evaluator doesn't fall back to "var lookup of `self`" and
+    // surface `Unknown`.
+    if let Some(value) = eval_context_builtin(expr) {
+        return value;
+    }
+
+    // Cross-program call: `Program.aleo/function(args)`.  Detected
+    // BEFORE binary operator scans so the embedded `/` and `.`
+    // characters don't get misparsed as division / field access.
+    // The function is looked up by its bare name in the merged
+    // `prog.by_name` table -- imports are loaded into the same
+    // table by `emit_trace_events`.
+    if let Some(call_value) =
+        try_eval_qualified_call(prog, env, expr, sub_calls, io_events, after_binding)
+    {
+        return call_value;
+    }
+
     // Ternary: `cond ? a : b` -- the `?` and `:` must be at top level.
     if let Some(qpos) = find_top_level_char(expr, '?') {
         if let Some(cpos) = find_top_level_char_from(expr, ':', qpos + 1) {
-            let cond = eval_expr(prog, env, &expr[..qpos], sub_calls, io_events, after_binding);
+            let cond = eval_expr(
+                prog,
+                env,
+                &expr[..qpos],
+                sub_calls,
+                io_events,
+                after_binding,
+            );
             let then_branch = eval_expr(
                 prog,
                 env,
@@ -3402,6 +3644,12 @@ fn eval_expr(
     }
 
     // Top-level `+` / `-` (left-associative; scan right-to-left).
+    // Default arithmetic is *checked* in Leo: a true-mathematical
+    // result outside the representable range of the operand type
+    // surfaces as a `LeoOverflow` io_event (parallel to
+    // `LeoAssert` from M10).  The wrapping result is still bound
+    // so downstream arithmetic stays well-defined and the trace
+    // round-trips cleanly through ct-print.
     for op_char in &['+', '-'] {
         if let Some(pos) = find_top_level_operator_excluding_unary(expr, *op_char) {
             let left = expr[..pos].trim();
@@ -3411,14 +3659,21 @@ fn eval_expr(
                 let rv = eval_expr(prog, env, right, sub_calls, io_events, after_binding);
                 let li = lv.as_int();
                 let ri = rv.as_int();
-                let r = if *op_char == '+' {
-                    li.wrapping_add(ri)
-                } else {
-                    li.wrapping_sub(ri)
-                };
                 let t = match (&lv, &rv) {
                     (Value::Int(_, t), _) | (_, Value::Int(_, t)) => t.clone(),
                     _ => "u32".to_string(),
+                };
+                if detect_checked_overflow(li, ri, *op_char, &t) {
+                    io_events.push(EmittedIoEvent {
+                        is_write: false,
+                        metadata: "LeoOverflow",
+                        text: expr.to_string(),
+                    });
+                }
+                let r = if *op_char == '+' {
+                    wrapping_add_in_type(li, ri, &t)
+                } else {
+                    wrapping_sub_in_type(li, ri, &t)
                 };
                 return Value::Int(r, t);
             }
@@ -3435,8 +3690,19 @@ fn eval_expr(
                 let rv = eval_expr(prog, env, right, sub_calls, io_events, after_binding);
                 let li = lv.as_int();
                 let ri = rv.as_int();
+                let t = match (&lv, &rv) {
+                    (Value::Int(_, t), _) | (_, Value::Int(_, t)) => t.clone(),
+                    _ => "u32".to_string(),
+                };
+                if *op_char == '*' && detect_checked_overflow(li, ri, '*', &t) {
+                    io_events.push(EmittedIoEvent {
+                        is_write: false,
+                        metadata: "LeoOverflow",
+                        text: expr.to_string(),
+                    });
+                }
                 let r = match *op_char {
-                    '*' => li.wrapping_mul(ri),
+                    '*' => wrapping_mul_in_type(li, ri, &t),
                     '/' => {
                         if ri == 0 {
                             0
@@ -3453,12 +3719,29 @@ fn eval_expr(
                     }
                     _ => 0,
                 };
-                let t = match (&lv, &rv) {
-                    (Value::Int(_, t), _) | (_, Value::Int(_, t)) => t.clone(),
-                    _ => "u32".to_string(),
-                };
                 return Value::Int(r, t);
             }
+        }
+    }
+
+    // Explicit type cast: `<expr> as <type>`.  Binds tighter than
+    // `+`/`-`/`*` (those operator scans already split the cast off
+    // when they recurse on each side), so by the time we get here
+    // the entire expression is a single cast chain.  Truncates the
+    // payload modulo the target type's representable range so
+    // narrowing casts surface the post-truncation value (e.g.
+    // `300u32 as u8 == 44`), and re-types the value with the
+    // target type id so downstream tooling can distinguish
+    // `u32(100)` from `field(100)` via `type_id`.
+    if let Some(as_pos) = find_top_level_keyword(expr, " as ") {
+        let lhs = expr[..as_pos].trim();
+        let rhs = expr[as_pos + 4..].trim();
+        if !lhs.is_empty() && !rhs.is_empty() {
+            let base_v = eval_expr(prog, env, lhs, sub_calls, io_events, after_binding);
+            let raw = base_v.as_int();
+            let target_type = rhs.split_whitespace().next().unwrap_or(rhs).to_string();
+            let truncated = truncate_to_type(raw, &target_type);
+            return Value::Int(truncated, target_type);
         }
     }
 
@@ -3585,10 +3868,34 @@ fn eval_expr(
         }
     }
 
-    // Field access: `p.x` or `p.0` (for tuples).
+    // Field access: `p.x` or `p.0` (for tuples).  When the right
+    // side has shape `method(args)`, evaluate it as an instance-
+    // method call instead -- this is how Leo expresses Aleo's
+    // wrapping (`add_wrapped`) and saturating (`add_saturating`)
+    // arithmetic modes.
     if let Some(dot) = find_top_level_char(expr, '.') {
         let base = expr[..dot].trim();
         let field = expr[dot + 1..].trim();
+        if let Some(open) = field.find('(') {
+            if field.ends_with(')') {
+                let method = field[..open].trim();
+                if !method.is_empty()
+                    && method.chars().all(|c| c.is_alphanumeric() || c == '_')
+                    && !method.chars().next().is_some_and(|c| c.is_ascii_digit())
+                {
+                    let inner = &field[open + 1..field.len() - 1];
+                    let arg_exprs = split_top_level_commas(inner);
+                    let arg_values: Vec<Value> = arg_exprs
+                        .iter()
+                        .map(|a| {
+                            eval_expr(prog, env, a.trim(), sub_calls, io_events, after_binding)
+                        })
+                        .collect();
+                    let base_v = eval_expr(prog, env, base, sub_calls, io_events, after_binding);
+                    return eval_instance_method(&base_v, method, &arg_values, expr, io_events);
+                }
+            }
+        }
         let base_v = eval_expr(prog, env, base, sub_calls, io_events, after_binding);
         return access_field(&base_v, field);
     }
@@ -3664,6 +3971,100 @@ fn access_field(base: &Value, field: &str) -> Value {
     }
 }
 
+/// Try to evaluate a cross-program call expression of shape
+/// `Program.aleo/function(args)`.  Returns `Some(Value)` when
+/// the expression matches; `None` when it does not so the caller
+/// can fall through to generic evaluation.
+///
+/// The function is looked up by its bare name in `prog.by_name`
+/// (the merged function table includes every imported program's
+/// functions) and dispatched through the same `execute_leo_function`
+/// path as a local call.  The SubCall is captured so the emit
+/// pass surfaces the call_entry / call_exit pair against the
+/// imported function's source path -- the writer registers it
+/// with the qualified name (`math_lib.aleo/double`) so downstream
+/// tooling can disambiguate cross-program calls in the function
+/// table.
+fn try_eval_qualified_call(
+    prog: &LeoProgram,
+    env: &EvalEnv,
+    expr: &str,
+    sub_calls: &mut Vec<SubCall>,
+    io_events: &mut Vec<EmittedIoEvent>,
+    after_binding: usize,
+) -> Option<Value> {
+    if !expr.ends_with(')') {
+        return None;
+    }
+    let open = expr.find('(')?;
+    let head = expr[..open].trim();
+    let slash = head.find('/')?;
+    let prog_part = head[..slash].trim();
+    let func_name = head[slash + 1..].trim();
+    if !prog_part.ends_with(".aleo") || func_name.is_empty() {
+        return None;
+    }
+    if !func_name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    let inner = &expr[open + 1..expr.len() - 1];
+    let arg_exprs = split_top_level_commas(inner);
+    let arg_values: Vec<Value> = arg_exprs
+        .iter()
+        .map(|a| eval_expr(prog, env, a.trim(), sub_calls, io_events, after_binding))
+        .collect();
+    let callee = prog.by_name.get(func_name)?;
+    let formals: Vec<(String, Value)> = callee
+        .parameters
+        .iter()
+        .enumerate()
+        .map(|(i, (pname, _ptype))| {
+            let v = arg_values.get(i).cloned().unwrap_or(Value::Unknown);
+            (pname.clone(), v)
+        })
+        .collect();
+    let trace = execute_leo_function(prog, callee, &formals);
+    let rv = trace.return_value.clone();
+    sub_calls.push(SubCall {
+        callee: func_name.to_string(),
+        args: formals,
+        after_binding,
+        trace,
+    });
+    Some(rv)
+}
+
+/// Evaluate an Aleo call-context built-in expression like
+/// `self.caller`, `self.signer`, or `block.height`.  Returns
+/// `None` for anything else so the caller can fall through to
+/// generic evaluation.
+///
+/// `self.caller` and `self.signer` surface as bech32m address
+/// strings -- the structured evaluator doesn't model real signing
+/// keys so we use deterministic stand-in literals (the canonical
+/// Aleo zero-address for `self.caller`, and a distinct fixed
+/// address for `self.signer`) so the address payload round-trips
+/// through `ValueRecord::String` without depending on a key
+/// generation oracle.
+///
+/// `block.height` surfaces as a typed `u32` so finalize-scope
+/// arithmetic on the chain height stays well-defined; the value
+/// is the deterministic stand-in `100u32`.
+fn eval_context_builtin(expr: &str) -> Option<Value> {
+    match expr {
+        "self.caller" => Some(Value::Str(
+            "aleo1qnr4dkkvkgfqph0vzc3y6z2eu975wnpz2925ntjccd76cqsnpdjsdhgg6c".to_string(),
+            "address".to_string(),
+        )),
+        "self.signer" => Some(Value::Str(
+            "aleo1k7nl06ge2nlfm70cd6cf2asgn9w6m6kk4tytfgsugvyt5p3c2g8slzdr3a".to_string(),
+            "address".to_string(),
+        )),
+        "block.height" => Some(Value::Int(100, "u32".to_string())),
+        _ => None,
+    }
+}
+
 /// Evaluate an Aleo builtin static-method call like
 /// `BHP256::hash_to_field(x)` or `Mapping::set(balances, k, v)`.
 ///
@@ -3689,15 +4090,24 @@ fn eval_builtin_method(
     if family == "Mapping" {
         match method {
             "get" => {
+                // `Mapping::get(map, key)` -- the variant WITHOUT a
+                // `get_or_use` default fallback.  On the real chain
+                // this aborts the finalize when the key is absent;
+                // the source-level evaluator does not model an
+                // in-memory mapping store so EVERY `Mapping::get`
+                // call is treated as a non-existent-key access and
+                // surfaces a `LeoFinalizeAbort` `EventLogKind::Error`
+                // io_event.  `execute_block` propagates the abort
+                // by halting the rest of the function and forcing
+                // the return value to `Unknown` so the CloseFrame
+                // marks the frame as failed (no return payload
+                // emitted).
                 io_events.push(EmittedIoEvent {
                     is_write: false,
-                    metadata: "LeoMappingGet",
+                    metadata: "LeoFinalizeAbort",
                     text: expr_text.to_string(),
                 });
-                // `Mapping::get(map, key)` -- without an in-memory
-                // store the source-level evaluator returns 0 so
-                // downstream arithmetic stays well-defined.
-                return Value::Int(0, "u32".to_string());
+                return Value::Unknown;
             }
             "get_or_use" => {
                 io_events.push(EmittedIoEvent {
@@ -3800,6 +4210,188 @@ fn eval_builtin_method(
         text: expr_text.to_string(),
     });
     Value::Unknown
+}
+
+/// Evaluate an Aleo instance-method call like `a.add_wrapped(b)`
+/// or `a.add_saturating(b)` -- the wrapping / saturating arithmetic
+/// modes that Leo exposes alongside the default checked operators.
+///
+/// Wrapping methods complete silently with the wrapping result.
+/// Saturating methods clamp to the type's max / min bound.  Both
+/// are typed with the receiver's type so downstream arithmetic
+/// stays well-defined.  Unknown methods return `Value::Unknown`
+/// without emitting an io_event so the caller can fall through to
+/// generic field-access semantics.
+fn eval_instance_method(
+    receiver: &Value,
+    method: &str,
+    args: &[Value],
+    _expr_text: &str,
+    _io_events: &mut [EmittedIoEvent],
+) -> Value {
+    let (lhs, type_name) = match receiver {
+        Value::Int(i, t) => (*i, t.clone()),
+        _ => return Value::Unknown,
+    };
+    let rhs = args.first().map(|v| v.as_int()).unwrap_or(0);
+    let (max_val, min_val) = type_bounds(&type_name);
+    match method {
+        "add_wrapped" => Value::Int(wrapping_add_in_type(lhs, rhs, &type_name), type_name),
+        "sub_wrapped" => Value::Int(wrapping_sub_in_type(lhs, rhs, &type_name), type_name),
+        "mul_wrapped" => Value::Int(wrapping_mul_in_type(lhs, rhs, &type_name), type_name),
+        "add_saturating" => {
+            let sum = lhs.saturating_add(rhs);
+            let clamped = sum.clamp(min_val, max_val);
+            Value::Int(clamped, type_name)
+        }
+        "sub_saturating" => {
+            let diff = lhs.saturating_sub(rhs);
+            let clamped = diff.clamp(min_val, max_val);
+            Value::Int(clamped, type_name)
+        }
+        "mul_saturating" => {
+            let prod = lhs.saturating_mul(rhs);
+            let clamped = prod.clamp(min_val, max_val);
+            Value::Int(clamped, type_name)
+        }
+        _ => Value::Unknown,
+    }
+}
+
+/// Return `(max, min)` representable values for a Leo numeric
+/// type name.  Used by saturating arithmetic and the
+/// checked-overflow detector.  Unknown types fall back to the
+/// `u32` bounds so arithmetic on `field` / `scalar` (which the
+/// recorder treats as unbounded ints) stays well-defined.
+fn type_bounds(type_name: &str) -> (i64, i64) {
+    match type_name {
+        "u8" => (u8::MAX as i64, 0),
+        "u16" => (u16::MAX as i64, 0),
+        "u32" => (u32::MAX as i64, 0),
+        "u64" => (i64::MAX, 0),
+        "u128" => (i64::MAX, 0),
+        "i8" => (i8::MAX as i64, i8::MIN as i64),
+        "i16" => (i16::MAX as i64, i16::MIN as i64),
+        "i32" => (i32::MAX as i64, i32::MIN as i64),
+        "i64" => (i64::MAX, i64::MIN),
+        "i128" => (i64::MAX, i64::MIN),
+        _ => (u32::MAX as i64, 0),
+    }
+}
+
+/// Wrap `a + b` modulo the type's representable range.  Used by
+/// `add_wrapped` and the checked-overflow detector (which emits a
+/// `LeoOverflow` io_event but still propagates the wrapping result
+/// so downstream arithmetic stays well-defined).
+fn wrapping_add_in_type(a: i64, b: i64, type_name: &str) -> i64 {
+    match type_name {
+        "u8" => (a as u8).wrapping_add(b as u8) as i64,
+        "u16" => (a as u16).wrapping_add(b as u16) as i64,
+        "u32" => (a as u32).wrapping_add(b as u32) as i64,
+        "u64" => (a as u64).wrapping_add(b as u64) as i64,
+        "i8" => (a as i8).wrapping_add(b as i8) as i64,
+        "i16" => (a as i16).wrapping_add(b as i16) as i64,
+        "i32" => (a as i32).wrapping_add(b as i32) as i64,
+        _ => a.wrapping_add(b),
+    }
+}
+
+fn wrapping_sub_in_type(a: i64, b: i64, type_name: &str) -> i64 {
+    match type_name {
+        "u8" => (a as u8).wrapping_sub(b as u8) as i64,
+        "u16" => (a as u16).wrapping_sub(b as u16) as i64,
+        "u32" => (a as u32).wrapping_sub(b as u32) as i64,
+        "u64" => (a as u64).wrapping_sub(b as u64) as i64,
+        "i8" => (a as i8).wrapping_sub(b as i8) as i64,
+        "i16" => (a as i16).wrapping_sub(b as i16) as i64,
+        "i32" => (a as i32).wrapping_sub(b as i32) as i64,
+        _ => a.wrapping_sub(b),
+    }
+}
+
+fn wrapping_mul_in_type(a: i64, b: i64, type_name: &str) -> i64 {
+    match type_name {
+        "u8" => (a as u8).wrapping_mul(b as u8) as i64,
+        "u16" => (a as u16).wrapping_mul(b as u16) as i64,
+        "u32" => (a as u32).wrapping_mul(b as u32) as i64,
+        "u64" => (a as u64).wrapping_mul(b as u64) as i64,
+        "i8" => (a as i8).wrapping_mul(b as i8) as i64,
+        "i16" => (a as i16).wrapping_mul(b as i16) as i64,
+        "i32" => (a as i32).wrapping_mul(b as i32) as i64,
+        _ => a.wrapping_mul(b),
+    }
+}
+
+/// Truncate `raw` to the representable range of `type_name`.
+/// For unsigned types, this is `raw mod (max + 1)`.  For signed
+/// types, the bit-pattern is reinterpreted (so `300u32 as i8`
+/// surfaces as `(300 as i8) = 44` after the standard Rust cast
+/// chain).  Curve types (`field`, `scalar`, `group`) are
+/// unbounded for the source-level evaluator so the value passes
+/// through unchanged.
+fn truncate_to_type(raw: i64, type_name: &str) -> i64 {
+    match type_name {
+        "u8" => (raw as u8) as i64,
+        "u16" => (raw as u16) as i64,
+        "u32" => (raw as u32) as i64,
+        "u64" => raw,
+        "u128" => raw,
+        "i8" => (raw as i8) as i64,
+        "i16" => (raw as i16) as i64,
+        "i32" => (raw as i32) as i64,
+        "i64" => raw,
+        "i128" => raw,
+        // Curve types: identity (real curve math lives in snarkVM).
+        _ => raw,
+    }
+}
+
+/// Find a top-level occurrence of a multi-character keyword
+/// (e.g. ` as `) ignoring matches nested in parens / brackets /
+/// braces.  Returns the byte offset of the first character of the
+/// match.
+fn find_top_level_keyword(expr: &str, keyword: &str) -> Option<usize> {
+    let bytes = expr.as_bytes();
+    let kbytes = keyword.as_bytes();
+    let mut depth_paren = 0i32;
+    let mut depth_brack = 0i32;
+    let mut depth_brace = 0i32;
+    let mut i = 0;
+    while i + kbytes.len() <= bytes.len() {
+        let c = bytes[i] as char;
+        match c {
+            '(' => depth_paren += 1,
+            ')' => depth_paren -= 1,
+            '[' => depth_brack += 1,
+            ']' => depth_brack -= 1,
+            '{' => depth_brace += 1,
+            '}' => depth_brace -= 1,
+            _ => {}
+        }
+        if depth_paren == 0
+            && depth_brack == 0
+            && depth_brace == 0
+            && &bytes[i..i + kbytes.len()] == kbytes
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Detect whether the checked operation `a OP b` (for `OP` in
+/// `+ - *`) overflows the representable range of `type_name`.
+/// Returns `true` if the true mathematical result is outside the
+/// `[min, max]` bounds for the type.
+fn detect_checked_overflow(a: i64, b: i64, op: char, type_name: &str) -> bool {
+    let (max_val, min_val) = type_bounds(type_name);
+    match op {
+        '+' => a.checked_add(b).is_none_or(|r| r > max_val || r < min_val),
+        '-' => a.checked_sub(b).is_none_or(|r| r > max_val || r < min_val),
+        '*' => a.checked_mul(b).is_none_or(|r| r > max_val || r < min_val),
+        _ => false,
+    }
 }
 
 struct IfExpr {

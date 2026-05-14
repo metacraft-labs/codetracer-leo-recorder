@@ -1800,3 +1800,765 @@ fn test_record_token_test_via_ct_print_full() {
         ]
     );
 }
+
+// ===========================================================================
+// M11 Round 2 — additional priority fixtures
+// ===========================================================================
+//
+// Extends Round 1 (multi_function / field_group_scalar_arith /
+// hash_builtins / mapping_finalize / record_token) with five more
+// fixtures that pin behaviour for:
+//
+//   1. context_builtins_test.leo      -- self.caller / self.signer / block.height
+//   2. int_overflow_modes_test.leo    -- wrapping/checked/saturating arithmetic
+//   3. cast_test.leo                  -- explicit `as <type>` casts
+//   4. async_finalize_failure_test.leo -- runtime finalize abort on Mapping::get
+//   5. program_imports_test.leo       -- multi-program / cross-program calls
+
+// --- context_builtins_test.leo --------------------------------------------
+
+/// Records `context_builtins_test.leo` and pins the full event
+/// shape for Aleo's call-context built-ins (`self.caller`,
+/// `self.signer`) and the finalize-scope chain context read
+/// (`block.height`).
+///
+/// The structured evaluator surfaces `self.caller` / `self.signer`
+/// as `ValueRecord::String` (bech32m address form, deterministic
+/// stand-in literals so the trace doesn't depend on a real signing
+/// key) and `block.height` as `ValueRecord::Int` typed `u32`.
+/// Each builtin is read at most once per call frame -- the call
+/// site that introduces the binding sees the value, and the
+/// transition / finalize frames are NOT double-emitting the same
+/// payload across the call boundary.
+#[test]
+fn test_context_builtins_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_context_builtins_test_via_ct_print_full",
+        "context_builtins_test.leo",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["main", "who_am_i", "finalize_who_am_i"]);
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(11), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(1),
+        "io_events; counts={counts}"
+    );
+
+    assert_step_indices_monotonic(&doc);
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["who_am_i".to_string(), "finalize_who_am_i".to_string()]
+    );
+
+    // The `address` type id must be registered so downstream tooling
+    // can distinguish address-shaped strings from generic strings.
+    let types: Vec<&str> = doc["types"]
+        .as_array()
+        .expect("types array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        types.contains(&"address"),
+        "expected `address` in registered types; got {types:?}"
+    );
+
+    // ----- Decoded variable values --------------------------------------
+    // Walk every step's `vars` and pin the (varname, kind, payload)
+    // tuple.  String payloads carry the address text verbatim; Int
+    // payloads carry the height stand-in (100u32).
+    let events = doc["events"].as_array().expect("events array");
+    let observed: Vec<(String, String, String)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .map(|v| {
+            let name = v["varname"].as_str().expect("varname").to_string();
+            let kind = v["value"]["kind"].as_str().expect("kind").to_string();
+            let payload = match kind.as_str() {
+                "String" => v["value"]["text"].as_str().expect("text").to_string(),
+                "Int" => v["value"]["i"].as_i64().expect("Int.i").to_string(),
+                other => panic!(
+                    "unexpected ValueRecord kind `{other}` for var `{name}`; \
+                     extend this test if a new variant has landed"
+                ),
+            };
+            (name, kind, payload)
+        })
+        .collect();
+    assert_eq!(
+        observed,
+        vec![
+            (
+                "caller_addr".to_string(),
+                "String".to_string(),
+                "aleo1qnr4dkkvkgfqph0vzc3y6z2eu975wnpz2925ntjccd76cqsnpdjsdhgg6c".to_string()
+            ),
+            (
+                "signer_addr".to_string(),
+                "String".to_string(),
+                "aleo1k7nl06ge2nlfm70cd6cf2asgn9w6m6kk4tytfgsugvyt5p3c2g8slzdr3a".to_string()
+            ),
+            (
+                "_addr".to_string(),
+                "String".to_string(),
+                "aleo1qnr4dkkvkgfqph0vzc3y6z2eu975wnpz2925ntjccd76cqsnpdjsdhgg6c".to_string()
+            ),
+            ("height".to_string(), "Int".to_string(), "100".to_string()),
+            ("recorded".to_string(), "Int".to_string(), "100".to_string()),
+        ]
+    );
+
+    // ----- Return values --------------------------------------------------
+    // who_am_i returns the caller address as String.
+    // finalize_who_am_i returns the block height as Int(100).
+    let returns: Vec<(String, &serde_json::Value)> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            (
+                e["function"].as_str().expect("function").to_string(),
+                &e["return_value"],
+            )
+        })
+        .collect();
+    assert_eq!(returns.len(), 2);
+
+    let (who_name, who_rv) = &returns[0];
+    assert_eq!(who_name, "who_am_i");
+    assert_eq!(who_rv["kind"].as_str(), Some("String"));
+    assert_eq!(
+        who_rv["text"].as_str(),
+        Some("aleo1qnr4dkkvkgfqph0vzc3y6z2eu975wnpz2925ntjccd76cqsnpdjsdhgg6c")
+    );
+
+    let (fin_name, fin_rv) = &returns[1];
+    assert_eq!(fin_name, "finalize_who_am_i");
+    assert_eq!(fin_rv["kind"].as_str(), Some("Int"));
+    assert_eq!(fin_rv["i"].as_i64(), Some(100));
+
+    // ----- io_event for the Mapping::set inside finalize ---------------
+    let io_events: Vec<(String, String)> = events
+        .iter()
+        .filter(|e| e["kind"] == "io")
+        .map(|e| {
+            (
+                e["io_kind"].as_str().unwrap_or("").to_string(),
+                e["text"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        io_events,
+        vec![(
+            "ioStdout".to_string(),
+            "Mapping::set(last_seen, self.caller, height)".to_string()
+        )]
+    );
+}
+
+// --- int_overflow_modes_test.leo ------------------------------------------
+
+/// Records `int_overflow_modes_test.leo` and pins the full event
+/// shape for Leo's three integer arithmetic modes near the u32
+/// boundary.  Checked overflow surfaces as a `LeoOverflow`
+/// `EventLogKind::Read` io_event (the read variant maps to
+/// `ioFileOp` in ct-print's JSON), matching the M10 `LeoAssert`
+/// shape; wrapping completes silently with the wrapping result;
+/// saturating clamps to `u32::MAX`.
+#[test]
+fn test_int_overflow_modes_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_int_overflow_modes_test_via_ct_print_full",
+        "int_overflow_modes_test.leo",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["main", "compute"]);
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(10), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    // Exactly one io_event: the `near_max + two` checked-overflow
+    // signal.  `add_wrapped` and `add_saturating` are non-trapping
+    // by spec and emit nothing extra.  `1u32 + two` does NOT
+    // overflow so it must NOT emit an io_event.
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(1),
+        "io_events; counts={counts}"
+    );
+
+    assert_step_indices_monotonic(&doc);
+    assert_eq!(observed_call_sequence(&doc), vec!["compute".to_string()]);
+
+    // ----- Decoded variable sequence -----------------------------------
+    // near_max = u32::MAX - 1 = 4_294_967_294
+    // two = 2
+    // wrapped = near_max.add_wrapped(two) = 0 (silent wrap)
+    // saturated = near_max.add_saturating(two) = u32::MAX = 4_294_967_295
+    // bad = near_max + two = 0 (wrapping result; LeoOverflow io_event also emitted)
+    // safe = 1 + two = 3 (no overflow, no event)
+    assert_eq!(
+        observed_var_sequence(&doc),
+        vec![
+            ("near_max".to_string(), 4_294_967_294),
+            ("two".to_string(), 2),
+            ("wrapped".to_string(), 0),
+            ("saturated".to_string(), 4_294_967_295),
+            ("bad".to_string(), 0),
+            ("safe".to_string(), 3),
+        ]
+    );
+
+    // ----- io_event: exactly one LeoOverflow on `near_max + two` -------
+    let events = doc["events"].as_array().expect("events array");
+    let io_events: Vec<(String, String)> = events
+        .iter()
+        .filter(|e| e["kind"] == "io")
+        .map(|e| {
+            (
+                e["io_kind"].as_str().unwrap_or("").to_string(),
+                e["text"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        io_events,
+        vec![("ioFileOp".to_string(), "near_max + two".to_string())]
+    );
+
+    // ----- Return value: compute returns `safe` = 3 (the non-overflowing arm)
+    let returns: Vec<(String, i64)> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let name = e["function"].as_str().expect("function").to_string();
+            let rv = &e["return_value"];
+            assert_eq!(
+                rv["kind"].as_str(),
+                Some("Int"),
+                "return value should decode as Int; got {rv}"
+            );
+            (name, rv["i"].as_i64().expect("Int.i"))
+        })
+        .collect();
+    assert_eq!(returns, vec![("compute".to_string(), 3)]);
+}
+
+// --- cast_test.leo --------------------------------------------------------
+
+/// Records `cast_test.leo` and pins the full event shape for
+/// Leo's explicit type-cast operator (` as <type>`).  The
+/// structured evaluator computes each cast with type-correct
+/// truncation (so e.g. `300u32 as u8 == 44`), registers the
+/// target type-id, and surfaces the post-cast payload as the
+/// step variable's value.
+#[test]
+fn test_cast_test_via_ct_print_full() {
+    let Some((doc, source_path)) =
+        record_and_dump_full("test_cast_test_via_ct_print_full", "cast_test.leo")
+    else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["main", "compute"]);
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(11), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    assert_step_indices_monotonic(&doc);
+    assert_eq!(observed_call_sequence(&doc), vec!["compute".to_string()]);
+
+    // ----- Decoded variable sequence + truncation pinning --------------
+    // small = 100u32
+    // big = small as u64 -> 100 (typed u64)
+    // wide = 300u32
+    // narrow = wide as u8 -> 44 (300 mod 256, typed u8 -- the truncation pin)
+    // f = big as field -> 100 (typed field)
+    // s = f as scalar -> 100 (typed scalar)
+    // total = small + (narrow as u32) -> 100 + 44 = 144
+    assert_eq!(
+        observed_var_sequence(&doc),
+        vec![
+            ("small".to_string(), 100),
+            ("big".to_string(), 100),
+            ("wide".to_string(), 300),
+            ("narrow".to_string(), 44),
+            ("f".to_string(), 100),
+            ("s".to_string(), 100),
+            ("total".to_string(), 144),
+        ]
+    );
+
+    // ----- Type-id distinction -----------------------------------------
+    // Each cast result must carry a DIFFERENT type-id from its source
+    // operand so downstream tooling can reason about the post-cast
+    // type.  Walk every step variable, collect (varname, type_id),
+    // and assert the cast chain produces three distinct ids
+    // (small/wide as u32; big as u64; narrow as u8; f as field; s as
+    // scalar; total back to u32).  We don't pin the absolute id
+    // values (they're writer-assigned), only that the ids for the
+    // cast outputs differ from `small`'s id and match each other
+    // when the lang_type matches.
+    let events = doc["events"].as_array().expect("events array");
+    let var_type_ids: Vec<(String, i64)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .map(|v| {
+            (
+                v["varname"].as_str().expect("varname").to_string(),
+                v["value"]["type_id"].as_i64().expect("type_id"),
+            )
+        })
+        .collect();
+    let id_for = |name: &str| -> i64 {
+        var_type_ids
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, id)| *id)
+            .unwrap_or_else(|| panic!("missing var {name} in type-id map: {var_type_ids:?}"))
+    };
+    let small_id = id_for("small");
+    let big_id = id_for("big");
+    let wide_id = id_for("wide");
+    let narrow_id = id_for("narrow");
+    let f_id = id_for("f");
+    let s_id = id_for("s");
+    let total_id = id_for("total");
+    assert_eq!(
+        small_id, wide_id,
+        "u32-typed vars must share a type id (small/wide); got small={small_id}, wide={wide_id}"
+    );
+    assert_eq!(
+        small_id, total_id,
+        "total is u32 like small; got small={small_id}, total={total_id}"
+    );
+    assert_ne!(
+        small_id, big_id,
+        "u32 (small) and u64 (big) must have distinct type ids"
+    );
+    assert_ne!(
+        small_id, narrow_id,
+        "u32 (small) and u8 (narrow) must have distinct type ids"
+    );
+    assert_ne!(
+        big_id, narrow_id,
+        "u64 (big) and u8 (narrow) must have distinct type ids"
+    );
+    assert_ne!(
+        big_id, f_id,
+        "u64 (big) and field (f) must have distinct type ids"
+    );
+    assert_ne!(
+        f_id, s_id,
+        "field (f) and scalar (s) must have distinct type ids"
+    );
+
+    // ----- Registered types include each cast target -------------------
+    let types: Vec<&str> = doc["types"]
+        .as_array()
+        .expect("types array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    for want in ["u32", "u64", "u8", "field", "scalar"] {
+        assert!(
+            types.contains(&want),
+            "expected `{want}` in registered types; got {types:?}"
+        );
+    }
+
+    // ----- Return value ------------------------------------------------
+    let returns: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let rv = &e["return_value"];
+            assert_eq!(rv["kind"].as_str(), Some("Int"));
+            rv["i"].as_i64().expect("Int.i")
+        })
+        .collect();
+    assert_eq!(returns, vec![144]);
+}
+
+// --- async_finalize_failure_test.leo --------------------------------------
+
+/// Records `async_finalize_failure_test.leo` and pins the full
+/// event shape for a runtime abort inside an `async finalize`
+/// block.  The finalize calls `Mapping::get(balances, caller)`
+/// (the variant WITHOUT a `get_or_use` default), which the
+/// structured evaluator treats as a non-existent-key access (the
+/// recorder does not model an in-memory mapping store), surfacing
+/// a `LeoFinalizeAbort` `EventLogKind::Error` io_event.  The
+/// finalize frame's CloseFrame is then marked as failed: the
+/// post-abort `Mapping::set` and `return updated` statements are
+/// NOT evaluated and the call's `return_value` is `None`.
+#[test]
+fn test_async_finalize_failure_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_async_finalize_failure_test_via_ct_print_full",
+        "async_finalize_failure_test.leo",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["main", "deposit", "finalize_deposit"]);
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(10), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
+    // Exactly one io_event: the LeoFinalizeAbort for Mapping::get.
+    // The post-abort Mapping::set MUST NOT execute -- if it did,
+    // io_events would be 2.
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(1),
+        "io_events; counts={counts}"
+    );
+
+    assert_step_indices_monotonic(&doc);
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["deposit".to_string(), "finalize_deposit".to_string()]
+    );
+
+    // ----- io_event: exactly one LeoFinalizeAbort with EventLogKind::Error
+    // ct-print surfaces EventLogKind::Error as `ioError` in the JSON.
+    let events = doc["events"].as_array().expect("events array");
+    let io_events: Vec<(String, String)> = events
+        .iter()
+        .filter(|e| e["kind"] == "io")
+        .map(|e| {
+            (
+                e["io_kind"].as_str().unwrap_or("").to_string(),
+                e["text"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        io_events,
+        vec![(
+            "ioError".to_string(),
+            "Mapping::get(balances, caller)".to_string()
+        )]
+    );
+
+    // ----- Per-call return values --------------------------------------
+    // deposit succeeds and returns reported = 50 (Int).
+    // finalize_deposit aborts -- its CloseFrame surfaces with
+    // return_value `None` so ct-print shows kind = "Void".
+    let returns: Vec<(String, &serde_json::Value)> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            (
+                e["function"].as_str().expect("function").to_string(),
+                &e["return_value"],
+            )
+        })
+        .collect();
+    assert_eq!(returns.len(), 2);
+
+    let (dep_name, dep_rv) = &returns[0];
+    assert_eq!(dep_name, "deposit");
+    assert_eq!(dep_rv["kind"].as_str(), Some("Int"));
+    assert_eq!(dep_rv["i"].as_i64(), Some(50));
+
+    let (fin_name, fin_rv) = &returns[1];
+    assert_eq!(fin_name, "finalize_deposit");
+    // The aborted CloseFrame surfaces as kind "Void" (the
+    // ct-print mapping of NONE_VALUE) -- emphatically NOT "Int".
+    assert_eq!(
+        fin_rv["kind"].as_str(),
+        Some("Void"),
+        "finalize_deposit aborted; return_value must be Void (NONE_VALUE), got {fin_rv}"
+    );
+
+    // ----- Pre-abort bindings only -------------------------------------
+    // deposit emits `amount=50` (formal param) twice (call_entry +
+    // body binding step) and then `reported=50`.  finalize_deposit
+    // emits its formal params (`caller=7`, `amount=50`) twice each,
+    // plus the failed `prior` binding (None-valued, NOT Int) at the
+    // abort site.  The post-abort bindings (`updated`, return) MUST
+    // NOT appear.  Main emits `deposited=50` (Int) and `finalized`
+    // (None, because finalize_deposit returned NONE_VALUE).
+    //
+    // `observed_var_sequence` would refuse the None-valued bindings
+    // (Int-only assertion) so we walk vars directly.
+    let observed: Vec<(String, String, Option<i64>)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .map(|v| {
+            let name = v["varname"].as_str().expect("varname").to_string();
+            let kind = v["value"]["kind"].as_str().unwrap_or("?").to_string();
+            let i = v["value"]["i"].as_i64();
+            (name, kind, i)
+        })
+        .collect();
+    // The abort site binds `prior` as `None` -- pin that exact shape.
+    let prior_entry = observed.iter().find(|(n, _, _)| n == "prior");
+    assert!(
+        prior_entry.is_some(),
+        "expected `prior` binding (abort site) in observed vars: {observed:?}"
+    );
+    let (_, prior_kind, prior_i) = prior_entry.unwrap();
+    assert_eq!(
+        prior_kind, "None",
+        "prior must surface as None at the abort site; got kind={prior_kind}, i={prior_i:?}"
+    );
+    assert!(
+        prior_i.is_none(),
+        "prior should not carry an Int payload at the abort site; got {prior_i:?}"
+    );
+
+    // The post-abort `updated` binding must NOT appear.
+    assert!(
+        !observed.iter().any(|(n, _, _)| n == "updated"),
+        "post-abort binding `updated` must NOT appear in the trace; \
+         finalize_deposit halted at the abort site.  observed = {observed:?}"
+    );
+
+    // Successful pre-finalize bindings: deposited=50, reported=50,
+    // and the deposit-frame formals.
+    assert!(
+        observed
+            .iter()
+            .any(|(n, k, i)| n == "reported" && k == "Int" && *i == Some(50)),
+        "expected reported=50 (Int) in deposit frame: {observed:?}"
+    );
+    assert!(
+        observed
+            .iter()
+            .any(|(n, k, i)| n == "deposited" && k == "Int" && *i == Some(50)),
+        "expected deposited=50 (Int) in main frame: {observed:?}"
+    );
+    // `finalized` exists in main but with None value (because
+    // finalize_deposit returned NONE_VALUE).
+    let finalized = observed
+        .iter()
+        .find(|(n, _, _)| n == "finalized")
+        .unwrap_or_else(|| panic!("expected finalized binding: {observed:?}"));
+    assert_eq!(
+        finalized.1, "None",
+        "finalized must reflect the aborted return as None; got {finalized:?}"
+    );
+}
+
+// --- program_imports_test.leo ---------------------------------------------
+
+/// Records `program_imports_test.leo`, which imports
+/// `math_lib.aleo` and invokes its `double` transition via the
+/// qualified call shape `math_lib.aleo/double(x)`.  Pins:
+///
+///   1. The recorder loads BOTH .leo files (the caller and the
+///      imported library) and merges their function tables.
+///   2. The cross-program call surfaces as a Call/Return pair
+///      with the qualified function name
+///      (`math_lib.aleo/double`) registered in the writer's
+///      function table.
+///   3. Source-line metadata for the callee's body correctly
+///      points at `math_lib.leo` (the imported library's source
+///      file) rather than the caller's source file.
+#[test]
+fn test_program_imports_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_program_imports_test_via_ct_print_full",
+        "program_imports_test.leo",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table: includes the QUALIFIED imported name -------
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec!["main", "compute", "math_lib.aleo/double"],
+        "expected qualified name `math_lib.aleo/double` in function \
+         table; got {functions:?}"
+    );
+
+    // ----- Path table: BOTH source files registered -------------------
+    let paths: Vec<&str> = doc["paths"]
+        .as_array()
+        .expect("paths array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        paths
+            .iter()
+            .any(|p| p.ends_with("program_imports_test.leo")),
+        "expected program_imports_test.leo in paths; got {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|p| p.ends_with("math_lib.leo")),
+        "expected math_lib.leo in paths -- the recorder must load \
+         the imported library as a separate source file; got {paths:?}"
+    );
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(9), "steps; counts={counts}");
+    // 2 calls: compute (locally) + math_lib.aleo/double (cross-program).
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+    // The 2 distinct paths must surface in counts as well.
+    assert_eq!(counts["paths"].as_u64(), Some(2), "paths; counts={counts}");
+
+    assert_step_indices_monotonic(&doc);
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["compute".to_string(), "math_lib.aleo/double".to_string()]
+    );
+
+    // ----- Source-line attribution: callee body steps point at math_lib.leo
+    // Walk every step inside the `math_lib.aleo/double` call frame
+    // and assert each one's `path` ends with `math_lib.leo` (not the
+    // caller's file).  The function-entry step is anchored at the
+    // call site in the caller (entry-step semantics), so we filter
+    // by the explicit lib-source pattern instead of by call frame.
+    let events = doc["events"].as_array().expect("events array");
+    let math_lib_steps: Vec<(String, i64)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .filter_map(|e| {
+            let path = e["path"].as_str()?;
+            if path.ends_with("math_lib.leo") {
+                Some((path.to_string(), e["line"].as_i64().unwrap_or(-1)))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        !math_lib_steps.is_empty(),
+        "expected at least one step event whose path is math_lib.leo \
+         (the callee body must surface against the library's source \
+         file); got events with no math_lib.leo path attribution"
+    );
+    // The library-side steps live at lines 5 (transition signature),
+    // 6 (let doubled = x + x), and 7 (return doubled).
+    let math_lib_lines: Vec<i64> = math_lib_steps.iter().map(|(_, l)| *l).collect();
+    for want_line in [5, 6, 7] {
+        assert!(
+            math_lib_lines.contains(&want_line),
+            "expected math_lib.leo line {want_line} in callee body steps; \
+             got {math_lib_lines:?}"
+        );
+    }
+
+    // ----- Decoded variable sequence -----------------------------------
+    // x=7 (double's formal, surfaces twice -- function-entry step +
+    // body-binding step).  doubled=14 (x + x).  Then back in
+    // compute: inner=14 (the call result).  doubled=15 (inner + 1).
+    assert_eq!(
+        observed_var_sequence(&doc),
+        vec![
+            ("x".to_string(), 7),
+            ("x".to_string(), 7),
+            ("doubled".to_string(), 14),
+            ("inner".to_string(), 14),
+            ("doubled".to_string(), 15),
+        ]
+    );
+
+    // ----- Per-call return values --------------------------------------
+    // double returns 14, compute returns 15.
+    let returns: Vec<(String, i64)> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let name = e["function"].as_str().expect("function").to_string();
+            let rv = &e["return_value"];
+            assert_eq!(
+                rv["kind"].as_str(),
+                Some("Int"),
+                "return value should decode as Int; got {rv}"
+            );
+            (name, rv["i"].as_i64().expect("Int.i"))
+        })
+        .collect();
+    assert_eq!(
+        returns,
+        vec![
+            ("math_lib.aleo/double".to_string(), 14),
+            ("compute".to_string(), 15),
+        ]
+    );
+}
