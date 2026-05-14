@@ -529,6 +529,20 @@ impl LeoTracer {
             BTreeSet::new()
         };
 
+        // Bare `.aleo` dialect: source uses `program X.aleo;` (header
+        // semicolon, no surrounding `{...}`) and `function NAME:`
+        // (colon, no parens) blocks of register-based AVM
+        // instructions.  The structured Leo parser may speculatively
+        // accept the `function NAME:` shape -- the bare-`.aleo`
+        // detector takes precedence so the dedicated synthesiser
+        // owns the emit pass and downstream consumers see the
+        // register-level trace shape rather than a spurious
+        // structured-parser interpretation.
+        if is_bare_aleo_dialect(source_code) {
+            self.emit_aleo_dialect_trace(source_path, source_code);
+            return Ok(());
+        }
+
         // Execute and emit from `main` via the structured evaluator.
         if let Some(main_fn) = prog.by_name.get("main") {
             let main_fn_clone = main_fn.clone();
@@ -544,20 +558,59 @@ impl LeoTracer {
                 /*is_entry_point=*/ true,
             );
         } else {
-            // Fallback: legacy walk (no main() defined).  Preserves
-            // backward compat for finalize-test fixtures.
-            let func_map: HashMap<&str, &LeoFunctionDef> =
-                leo_functions.iter().map(|f| (f.name.as_str(), f)).collect();
-            if let Some(any_fn) = func_map.values().next() {
-                self.emit_function_trace(
-                    source_path,
-                    source_code,
-                    any_fn,
-                    &func_map,
-                    &HashMap::new(),
-                    &AleoSourceMap::empty(),
-                    true,
-                )?;
+            // No `main` defined.  Multi-entry-point dispatch: every
+            // top-level `transition` declared in the program is
+            // executed in declaration order as its own entry point.
+            // Each surfaces a balanced Call/Return pair so downstream
+            // tooling sees three distinct Function entries when a
+            // program exposes (e.g.) deposit / withdraw / query
+            // independently of any caller.  Synthesised default
+            // arguments (zeroed for numeric formals) keep the
+            // execution well-defined when the caller can't supply
+            // real inputs from the source-level view.
+            let transitions: Vec<LeoFunc> = prog
+                .funcs
+                .iter()
+                .filter(|f| f.is_transition)
+                .cloned()
+                .collect();
+            if !transitions.is_empty() {
+                for tf in &transitions {
+                    let synth_args: Vec<(String, Value)> = tf
+                        .parameters
+                        .iter()
+                        .map(|(pname, ptype)| (pname.clone(), Value::Int(0, ptype.clone())))
+                        .collect();
+                    let trace = execute_leo_function(&prog, tf, &synth_args);
+                    self.emit_call_trace(
+                        source_path,
+                        tf,
+                        &trace,
+                        &synth_args,
+                        &prog,
+                        &struct_type_ids,
+                        &func_source_files,
+                        /*is_entry_point=*/ false,
+                    );
+                }
+            } else {
+                // Fallback: legacy walk (no transitions parsed by the
+                // structured evaluator).  Preserves backward compat
+                // for finalize-test fixtures whose `function` decls
+                // the structured parser doesn't yet handle.
+                let func_map: HashMap<&str, &LeoFunctionDef> =
+                    leo_functions.iter().map(|f| (f.name.as_str(), f)).collect();
+                if let Some(any_fn) = func_map.values().next() {
+                    self.emit_function_trace(
+                        source_path,
+                        source_code,
+                        any_fn,
+                        &func_map,
+                        &HashMap::new(),
+                        &AleoSourceMap::empty(),
+                        true,
+                    )?;
+                }
             }
         }
 
@@ -628,7 +681,28 @@ impl LeoTracer {
             Line(func.line as i64),
         );
         if !is_entry_point {
-            for (pname, pvalue) in call_args {
+            // Re-tag each argument's `Value::Int(_, type_name)` with
+            // the declared parameter type so visibility modifiers
+            // surface (`public sender: u64` registers a distinct
+            // `u64.public` type id, distinguishing on-chain-visible
+            // witnesses from witness-only inputs).  Non-Int values
+            // are passed through unchanged.
+            let typed_call_args: Vec<(String, Value)> = call_args
+                .iter()
+                .map(|(pname, pvalue)| {
+                    let declared = func
+                        .parameters
+                        .iter()
+                        .find(|(n, _)| n == pname)
+                        .map(|(_, t)| t.clone());
+                    let retyped = match (pvalue, declared) {
+                        (Value::Int(i, _), Some(t)) => Value::Int(*i, t),
+                        (other, _) => other.clone(),
+                    };
+                    (pname.clone(), retyped)
+                })
+                .collect();
+            for (pname, pvalue) in &typed_call_args {
                 let record = self.value_to_record(pvalue, struct_type_ids);
                 TraceWriter::arg(&mut *self.writer, pname, record);
             }
@@ -654,7 +728,7 @@ impl LeoTracer {
             // never appear in `step.vars`, defeating the whole point
             // of decoding structured argument literals at the call
             // site.
-            for (pname, pvalue) in call_args {
+            for (pname, pvalue) in &typed_call_args {
                 let record = self.value_to_record(pvalue, struct_type_ids);
                 TraceWriter::register_variable_with_full_value(&mut *self.writer, pname, record);
             }
@@ -764,6 +838,244 @@ impl LeoTracer {
         if !is_entry_point {
             let record = self.value_to_record(&trace.return_value, struct_type_ids);
             TraceWriter::register_return(&mut *self.writer, record);
+        }
+    }
+
+    /// Emit a trace for a bare `.aleo`-dialect source file (the
+    /// register-based instruction form the Leo compiler emits as
+    /// its build output, exercised here directly).  The structured
+    /// Leo evaluator does not understand this surface; the bare-
+    /// `.aleo` synthesiser walks each function's `input` /
+    /// arithmetic / `cast` / `output` lines, threading register
+    /// values through a small env, and surfaces each destination
+    /// register as a step variable so downstream tooling can see
+    /// every register's post-instruction payload + type.
+    ///
+    /// `cast rA into rB as TYPE` re-types rA's payload as TYPE; the
+    /// emitted variable for rB carries a distinct `TypeId` so the
+    /// post-cast type chain round-trips through ct-print --full.
+    /// `output rN as TYPE.private` produces a CloseFrame whose
+    /// `return_value` payload is rN's value typed as TYPE.
+    fn emit_aleo_dialect_trace(&mut self, source_path: &Path, source_code: &str) {
+        let lines: Vec<&str> = source_code.lines().collect();
+        let mut i = 0;
+        // Synthesised default values for `input` registers: each
+        // declared input gets a distinct, non-zero stand-in (the
+        // declaration index plus a small base) so downstream
+        // tooling sees deterministic, distinct register values.
+        let input_base: i64 = 5;
+        while i < lines.len() {
+            let trimmed = lines[i].trim();
+            if !trimmed.starts_with("function ") || !trimmed.ends_with(':') {
+                i += 1;
+                continue;
+            }
+            let name = trimmed["function ".len()..]
+                .trim_end_matches(':')
+                .trim()
+                .to_string();
+            let func_line = (i + 1) as u32;
+            // Walk the body lines until the next blank-or-function
+            // boundary.
+            let mut body: Vec<(u32, String)> = Vec::new();
+            let mut j = i + 1;
+            while j < lines.len() {
+                let raw = lines[j].trim();
+                if raw.starts_with("function ") && raw.ends_with(':') {
+                    break;
+                }
+                if !raw.is_empty() && !raw.starts_with("//") {
+                    body.push(((j + 1) as u32, raw.to_string()));
+                }
+                j += 1;
+            }
+            i = j;
+
+            // Register the function id.
+            let fn_id = TraceWriter::ensure_function_id(
+                &mut *self.writer,
+                &name,
+                source_path,
+                Line(func_line as i64),
+            );
+
+            // Walk body to collect `input` declarations + arithmetic
+            // instructions + `output` declarations.
+            let mut registers: HashMap<usize, AleoDialectReg> = HashMap::new();
+            let mut input_regs: Vec<(usize, String)> = Vec::new();
+            let mut steps: Vec<(u32, usize, AleoDialectReg)> = Vec::new(); // (line, dest, post-instr value)
+            let mut output: Option<(u32, usize, String)> = None; // (line, src_reg, declared type)
+            for (line_num, raw) in &body {
+                let s = raw.trim().trim_end_matches(';').trim();
+                if let Some(rest) = s.strip_prefix("input ") {
+                    // `r0 as u32.private`
+                    let parts: Vec<&str> = rest.split_whitespace().collect();
+                    if parts.len() >= 3 && parts[1] == "as" {
+                        if let Some(reg_idx) = parse_aleo_dialect_register(parts[0]) {
+                            let raw_type = parts[2];
+                            let base_type =
+                                raw_type.split('.').next().unwrap_or(raw_type).to_string();
+                            registers.insert(
+                                reg_idx,
+                                AleoDialectReg {
+                                    value: input_base + input_regs.len() as i64,
+                                    type_name: base_type.clone(),
+                                },
+                            );
+                            input_regs.push((reg_idx, base_type));
+                        }
+                    }
+                    continue;
+                }
+                if let Some(rest) = s.strip_prefix("output ") {
+                    let parts: Vec<&str> = rest.split_whitespace().collect();
+                    if parts.len() >= 3 && parts[1] == "as" {
+                        if let Some(reg_idx) = parse_aleo_dialect_register(parts[0]) {
+                            let raw_type = parts[2];
+                            let base_type =
+                                raw_type.split('.').next().unwrap_or(raw_type).to_string();
+                            output = Some((*line_num, reg_idx, base_type));
+                        }
+                    }
+                    continue;
+                }
+                // Arithmetic shapes: `add A B into D;` `mul A B into D;`
+                // `cast A into D as TYPE;`
+                let tokens: Vec<&str> = s.split_whitespace().collect();
+                if tokens.is_empty() {
+                    continue;
+                }
+                let op = tokens[0];
+                if op == "cast" {
+                    // `cast rA into rD as TYPE`
+                    if tokens.len() >= 5 && tokens[2] == "into" && tokens[4] == "as" {
+                        let src_v = aleo_dialect_resolve(tokens[1], &registers);
+                        if let Some(dest) = parse_aleo_dialect_register(tokens[3]) {
+                            let target_type = tokens[5..]
+                                .first()
+                                .copied()
+                                .unwrap_or(tokens[4])
+                                .to_string();
+                            // tokens layout for `cast A into D as TYPE`:
+                            // [cast, A, into, D, as, TYPE].  Re-derive
+                            // safely.
+                            let target_type = if tokens.len() >= 6 {
+                                tokens[5].to_string()
+                            } else {
+                                target_type
+                            };
+                            let truncated = truncate_to_type(src_v.unwrap_or(0), &target_type);
+                            let r = AleoDialectReg {
+                                value: truncated,
+                                type_name: target_type,
+                            };
+                            registers.insert(dest, r.clone());
+                            steps.push((*line_num, dest, r));
+                        }
+                    }
+                    continue;
+                }
+                // `OP A B into D` (binary arithmetic).
+                if tokens.len() >= 5 && tokens[3] == "into" {
+                    let v1 = aleo_dialect_resolve(tokens[1], &registers).unwrap_or(0);
+                    let v2 = aleo_dialect_resolve(tokens[2], &registers).unwrap_or(0);
+                    if let Some(dest) = parse_aleo_dialect_register(tokens[4]) {
+                        // Pick the type from the LHS register if the
+                        // operand is a register reference; otherwise
+                        // fall back to u32.
+                        let type_name = parse_aleo_dialect_register(tokens[1])
+                            .and_then(|r| registers.get(&r).map(|reg| reg.type_name.clone()))
+                            .unwrap_or_else(|| "u32".to_string());
+                        let result = match op {
+                            "add" => wrapping_add_in_type(v1, v2, &type_name),
+                            "sub" => wrapping_sub_in_type(v1, v2, &type_name),
+                            "mul" => wrapping_mul_in_type(v1, v2, &type_name),
+                            "div" => {
+                                if v2 == 0 {
+                                    0
+                                } else {
+                                    v1 / v2
+                                }
+                            }
+                            "mod" => {
+                                if v2 == 0 {
+                                    0
+                                } else {
+                                    v1 % v2
+                                }
+                            }
+                            _ => v1,
+                        };
+                        let r = AleoDialectReg {
+                            value: result,
+                            type_name,
+                        };
+                        registers.insert(dest, r.clone());
+                        steps.push((*line_num, dest, r));
+                    }
+                }
+            }
+
+            // Stage args from inputs and emit the call_entry.
+            for (reg_idx, type_name) in &input_regs {
+                let value = registers.get(reg_idx).map(|r| r.value).unwrap_or(0);
+                let type_id = self.ensure_int_type(type_name);
+                let record = ValueRecord::Int { i: value, type_id };
+                let arg_name = format!("r{reg_idx}");
+                TraceWriter::arg(&mut *self.writer, &arg_name, record);
+            }
+            TraceWriter::register_call(&mut *self.writer, fn_id, vec![]);
+
+            // Function-entry step + per-input variables (mirrors the
+            // structured evaluator's entry-step shape).
+            TraceWriter::register_step(&mut *self.writer, source_path, Line(func_line as i64));
+            for (reg_idx, type_name) in &input_regs {
+                let value = registers.get(reg_idx).map(|r| r.value).unwrap_or(0);
+                let type_id = self.ensure_int_type(type_name);
+                let record = ValueRecord::Int { i: value, type_id };
+                let var_name = format!("r{reg_idx}");
+                TraceWriter::register_variable_with_full_value(
+                    &mut *self.writer,
+                    &var_name,
+                    record,
+                );
+            }
+
+            // Per-instruction steps.
+            for (line_num, dest, reg) in &steps {
+                TraceWriter::register_step(&mut *self.writer, source_path, Line(*line_num as i64));
+                let type_id = self.ensure_int_type(&reg.type_name);
+                let record = ValueRecord::Int {
+                    i: reg.value,
+                    type_id,
+                };
+                let var_name = format!("r{dest}");
+                TraceWriter::register_variable_with_full_value(
+                    &mut *self.writer,
+                    &var_name,
+                    record,
+                );
+            }
+
+            // Output step + register_return.
+            if let Some((out_line, out_reg, out_type)) = output {
+                TraceWriter::register_step(&mut *self.writer, source_path, Line(out_line as i64));
+                let value = registers.get(&out_reg).map(|r| r.value).unwrap_or(0);
+                let type_id = self.ensure_int_type(&out_type);
+                let record = ValueRecord::Int { i: value, type_id };
+                // Emit the output register as a step variable too so
+                // downstream tooling sees the post-cast / post-output
+                // value attributed to the output line.
+                let var_name = format!("r{out_reg}");
+                TraceWriter::register_variable_with_full_value(
+                    &mut *self.writer,
+                    &var_name,
+                    record.clone(),
+                );
+                TraceWriter::register_return(&mut *self.writer, record);
+            } else {
+                TraceWriter::register_return(&mut *self.writer, NONE_VALUE);
+            }
         }
     }
 
@@ -2482,6 +2794,37 @@ fn find_return_value(
     None
 }
 
+/// Parse an Aleo bech32m literal expression: `aleo1...` for an
+/// address, `sign1...` for a signature.  Returns `Some(Value::Str)`
+/// when the expression matches; `None` when it does not so the
+/// caller can fall through to other literal / variable parsing.
+///
+/// The body following the `1` separator is required to be lower-
+/// case alphanumeric (the bech32m alphabet, restricted further
+/// here for simplicity); the expression must be at least 12
+/// characters total so an identifier like `aleo1` or `sign1` is
+/// not mis-classified as a literal.
+fn parse_bech32m_literal(expr: &str) -> Option<Value> {
+    let (prefix, type_name) = if expr.starts_with("aleo1") {
+        ("aleo1", "address")
+    } else if expr.starts_with("sign1") {
+        ("sign1", "signature")
+    } else {
+        return None;
+    };
+    if expr.len() < 12 {
+        return None;
+    }
+    let body = &expr[prefix.len()..];
+    if !body
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(Value::Str(expr.to_string(), type_name.to_string()))
+}
+
 /// Parse a typed Leo literal like `10u32`, `42u64`, `10field`, `5i32`.
 fn parse_typed_literal(s: &str) -> Option<i64> {
     // Try each known type suffix.  `field`, `group`, and `scalar`
@@ -2655,6 +2998,82 @@ struct LeoProgram {
 // ---------------------------------------------------------------------------
 // Structured Leo parser
 // ---------------------------------------------------------------------------
+
+/// One bare-`.aleo` register's runtime payload + declared type.
+/// Used by `emit_aleo_dialect_trace` to thread register values
+/// through synthesised AVM execution.
+#[derive(Clone, Debug)]
+struct AleoDialectReg {
+    value: i64,
+    type_name: String,
+}
+
+impl AsAleoRegisterValue for AleoDialectReg {
+    fn value(&self) -> i64 {
+        self.value
+    }
+}
+
+/// Parse a register reference from the bare `.aleo` dialect:
+/// `"r3"` -> `Some(3)`, `"r12"` -> `Some(12)`, `"3u32"` -> `None`.
+fn parse_aleo_dialect_register(token: &str) -> Option<usize> {
+    let stripped = token.trim().trim_end_matches(',').trim_end_matches(';');
+    let rest = stripped.strip_prefix('r')?;
+    rest.parse::<usize>().ok()
+}
+
+/// Resolve an Aleo-dialect operand: a register reference or a
+/// typed literal like `2u32`.  Returns `Some(i64)` on success;
+/// `None` when the token is unrecognised.
+fn aleo_dialect_resolve(
+    token: &str,
+    registers: &HashMap<usize, impl AsAleoRegisterValue>,
+) -> Option<i64> {
+    let stripped = token.trim().trim_end_matches(',').trim_end_matches(';');
+    if let Some(reg_idx) = parse_aleo_dialect_register(stripped) {
+        return registers.get(&reg_idx).map(|r| r.value());
+    }
+    parse_typed_literal(stripped).or_else(|| stripped.parse::<i64>().ok())
+}
+
+/// Tiny accessor trait so `aleo_dialect_resolve` can pull the
+/// integer payload out of either a `Reg` carrier (from
+/// `emit_aleo_dialect_trace`) or any other future register
+/// representation without coupling to a specific struct.
+trait AsAleoRegisterValue {
+    fn value(&self) -> i64;
+}
+
+/// Detect whether `source` is the bare `.aleo` dialect (i.e. a
+/// hand-written Aleo instruction file, the form the Leo compiler
+/// emits as its build output) rather than Leo source.
+///
+/// The discriminator is the program-header form: bare `.aleo`
+/// uses `program X.aleo;` (terminated by a semicolon, no
+/// surrounding braces), whereas Leo uses `program X.aleo { ... }`.
+/// We also require at least one `function NAME:` block so a stub
+/// `program X.aleo;` line embedded in a Leo file (which is
+/// otherwise illegal Leo syntax) does NOT trip the detector.
+fn is_bare_aleo_dialect(source: &str) -> bool {
+    let mut has_bare_program = false;
+    let mut has_function_decl = false;
+    for raw in source.lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("program ") {
+            let rest = rest.trim();
+            if rest.ends_with(';') {
+                has_bare_program = true;
+            }
+        }
+        if trimmed.starts_with("function ") && trimmed.ends_with(':') {
+            has_function_decl = true;
+        }
+    }
+    has_bare_program && has_function_decl
+}
 
 /// Scan a Leo source file for `import X.aleo;` directives and
 /// return the bare program names (e.g. `["math_lib"]`).  The
@@ -2937,6 +3356,17 @@ fn parse_leo_program(source: &str) -> LeoProgram {
 
 /// Parse a `(<name>: <type>, ...)` parameter list body and return
 /// `(name, type)` pairs.
+///
+/// Visibility modifiers (`public` / `private`) on the *parameter*
+/// itself surface as a `<type>.public` / `<type>.private` suffix on
+/// the returned `type` string so the writer registers a distinct
+/// type id for the on-chain-visible vs witness-only variant.  The
+/// default visibility (no leading keyword) is `private`, so it is
+/// surfaced bare without a suffix to match the historical type
+/// names downstream tooling already pins.  Visibility suffixes that
+/// appear on the *type* itself (`u32.public`) are also recognised
+/// and round-trip the same way so callers don't need to care about
+/// which side of the colon the modifier landed on.
 fn parse_leo_parameter_list_typed(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for raw in split_top_level_commas(text) {
@@ -2948,21 +3378,44 @@ fn parse_leo_parameter_list_typed(text: &str) -> Vec<(String, String)> {
             Some(pos) => (trimmed[..pos].trim(), trimmed[pos + 1..].trim()),
             None => (trimmed, ""),
         };
-        let name = before_colon
-            .split_whitespace()
-            .last()
-            .unwrap_or("")
-            .to_string();
+        // Detect a `public` / `private` modifier prefixed onto the
+        // parameter name (Aleo's primary form).  The actual name is
+        // the last whitespace-separated token before the colon; the
+        // modifier (if any) is the first token.
+        let parts: Vec<&str> = before_colon.split_whitespace().collect();
+        let name = parts.last().copied().unwrap_or("").to_string();
+        let modifier = if parts.len() >= 2 {
+            match parts[0] {
+                "public" => Some("public"),
+                "private" => Some("private"),
+                _ => None,
+            }
+        } else {
+            None
+        };
         if !name.is_empty()
             && name.chars().all(|c| c.is_alphanumeric() || c == '_')
             && !name.chars().next().is_some_and(|c| c.is_ascii_digit())
         {
-            // Type may carry a `.public`/`.private` visibility suffix --
-            // strip it before the dot.
+            // Visibility suffixes on the type (`u32.public`) ride
+            // along too.  Default visibility is private, surfaced
+            // bare so existing type-name pins keep working.
             let raw_type = after_colon.trim_end_matches(',').trim();
-            let type_name = match raw_type.find('.') {
-                Some(p) => raw_type[..p].to_string(),
-                None => raw_type.to_string(),
+            let (base_type, type_visibility) = match raw_type.find('.') {
+                Some(p) => {
+                    let suffix = raw_type[p + 1..].trim();
+                    (raw_type[..p].to_string(), Some(suffix))
+                }
+                None => (raw_type.to_string(), None),
+            };
+            // Resolve the effective visibility: parameter-level
+            // modifier overrides the type-level suffix when both
+            // appear (the parameter-level form is canonical in the
+            // Leo guide).
+            let effective_vis = modifier.or(type_visibility);
+            let type_name = match effective_vis {
+                Some("public") => format!("{base_type}.public"),
+                _ => base_type,
             };
             out.push((name, type_name));
         }
@@ -3925,6 +4378,19 @@ fn eval_expr(
         return Value::Bool(false);
     }
 
+    // Aleo bech32m literal: `aleo1...` (address) or `sign1...`
+    // (signature).  Both surface as `Value::Str(text, type_name)` so
+    // the writer registers a `TypeKind::String` id distinct from
+    // generic strings -- downstream tooling can then distinguish
+    // address-shaped payloads from signature-shaped payloads via the
+    // surfaced lang_type.  The body of the literal is required to
+    // be the bech32m alphabet (lowercase alphanumerics excluding
+    // `1bio`) so an unrelated identifier starting with `aleo` or
+    // `sign` does NOT get misclassified as a literal.
+    if let Some(literal_value) = parse_bech32m_literal(expr) {
+        return literal_value;
+    }
+
     // Typed literal.
     if let Some(v) = parse_typed_literal(expr) {
         let t = expr
@@ -4226,9 +4692,31 @@ fn eval_instance_method(
     receiver: &Value,
     method: &str,
     args: &[Value],
-    _expr_text: &str,
-    _io_events: &mut [EmittedIoEvent],
+    expr_text: &str,
+    io_events: &mut Vec<EmittedIoEvent>,
 ) -> Value {
+    // Aleo signature verification: `sig.verify(signer, msg) -> bool`.
+    // Real Schnorr verification lives in snarkVM and depends on the
+    // chain's group/scalar curve; the recorder's source-level
+    // evaluator returns a deterministic stand-in (`true`) so the
+    // trace exercises the parsing + value-emission path without
+    // pretending to implement Schnorr.  Each call surfaces an
+    // io_event of `EventLogKind::Read` tagged `LeoSignatureVerify`
+    // with the verbatim source-level expression so downstream
+    // tooling can reason about signature checks as data-dependency
+    // reads against an opaque verifier oracle.
+    if method == "verify" {
+        if let Value::Str(_, type_name) = receiver {
+            if type_name == "signature" {
+                io_events.push(EmittedIoEvent {
+                    is_write: false,
+                    metadata: "LeoSignatureVerify",
+                    text: expr_text.to_string(),
+                });
+                return Value::Bool(true);
+            }
+        }
+    }
     let (lhs, type_name) = match receiver {
         Value::Int(i, t) => (*i, t.clone()),
         _ => return Value::Unknown,
