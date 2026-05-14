@@ -2562,3 +2562,895 @@ fn test_program_imports_test_via_ct_print_full() {
         ]
     );
 }
+
+// ===========================================================================
+// M11 Round 3 — additional priority fixtures (public/private I/O,
+// commitments, signatures, .aleo dialect, multi-entry programs)
+// ===========================================================================
+
+// --- aleo_instructions_test.aleo ------------------------------------------
+
+/// Records `aleo_instructions_test.aleo` -- the bare `.aleo`
+/// dialect (the form the Leo compiler emits as its build output)
+/// exercised directly by the recorder.  The structured Leo
+/// evaluator does not understand register-based instructions; the
+/// recorder auto-detects the bare-`.aleo` shape (header
+/// `program X.aleo;` + colon-terminated `function NAME:`) and
+/// emits each instruction as a step event surfacing the
+/// destination register's post-instruction value.
+///
+/// The test pins:
+///   1. The function table contains the bare `compute` name (no
+///      colon, no qualifier).
+///   2. Every register (r0..r4) surfaces as a step variable,
+///      including the input registers anchored at the function-
+///      entry step.
+///   3. The cast result (r4) carries a DIFFERENT type id from the
+///      pre-cast registers (r2/r3 are u32; r4 is u64) so
+///      downstream tooling can reconstruct the post-cast type.
+///   4. The CloseFrame's `return_value` carries the output
+///      register's payload typed as the declared output type
+///      (u64, post-cast).
+#[test]
+fn test_aleo_instructions_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_aleo_instructions_test_via_ct_print_full",
+        "aleo_instructions_test.aleo",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table: bare `compute` --------------------------
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["compute"]);
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    // 1 absolute top-level step + 1 function-entry step + 3
+    // arithmetic steps (r2/r3/r4) + 1 output step = 6 step events.
+    assert_eq!(counts["steps"].as_u64(), Some(6), "steps; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    assert_step_indices_monotonic(&doc);
+    assert_eq!(observed_call_sequence(&doc), vec!["compute".to_string()]);
+
+    // ----- Per-register surfacing + decoded values ------------------
+    // Walk every step variable and assert the EXACT (varname, value)
+    // sequence below.  This guarantees every r0..r4 surfaces (the
+    // input registers re-emit on the function-entry step) AND pins
+    // each register's post-instruction value.
+    let events = doc["events"].as_array().expect("events array");
+
+    // ----- Decoded register values (in step-order) ------------------
+    // Each instruction emits a single step variable carrying the
+    // destination register's post-instruction value.  Inputs are
+    // re-emitted on the function-entry step (r0=5, r1=6).
+    //   r0 = 5  (input base 5 + 0)
+    //   r1 = 6  (input base 5 + 1)
+    //   r2 = r0 + r1 = 11
+    //   r3 = r2 * 2u32 = 22
+    //   r4 = r3 as u64 = 22
+    //   output r4 -> 22 (typed u64)
+    assert_eq!(
+        observed_var_sequence(&doc),
+        vec![
+            ("r0".to_string(), 5),
+            ("r1".to_string(), 6),
+            ("r0".to_string(), 5),
+            ("r1".to_string(), 6),
+            ("r2".to_string(), 11),
+            ("r3".to_string(), 22),
+            ("r4".to_string(), 22),
+            ("r4".to_string(), 22),
+        ]
+    );
+
+    // ----- Type-id distinction: cast produces a NEW type id ---------
+    // r0/r1/r2/r3 are u32; r4 is u64 (post-cast).  Walk every step
+    // variable and pin the (varname, type_id) pairs so the cast's
+    // post-truncation type chain round-trips.
+    let var_type_ids: Vec<(String, i64)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .map(|v| {
+            (
+                v["varname"].as_str().expect("varname").to_string(),
+                v["value"]["type_id"].as_i64().expect("type_id"),
+            )
+        })
+        .collect();
+    let id_for = |name: &str| -> i64 {
+        var_type_ids
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, id)| *id)
+            .unwrap_or_else(|| panic!("missing var {name} in type-id map: {var_type_ids:?}"))
+    };
+    let r0_id = id_for("r0");
+    let r1_id = id_for("r1");
+    let r2_id = id_for("r2");
+    let r3_id = id_for("r3");
+    let r4_id = id_for("r4");
+    assert_eq!(
+        r0_id, r1_id,
+        "u32 input registers must share a type id; got r0={r0_id}, r1={r1_id}"
+    );
+    assert_eq!(
+        r0_id, r2_id,
+        "r2 (sum of u32s) must keep the u32 type id; got r0={r0_id}, r2={r2_id}"
+    );
+    assert_eq!(
+        r0_id, r3_id,
+        "r3 (u32 * u32) must keep the u32 type id; got r0={r0_id}, r3={r3_id}"
+    );
+    assert_ne!(
+        r0_id, r4_id,
+        "r4 (cast u32 -> u64) must carry a DIFFERENT type id from u32; \
+         got r0={r0_id}, r4={r4_id}"
+    );
+
+    // ----- Output / return value: typed u64 -------------------------
+    let returns: Vec<(String, &serde_json::Value)> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            (
+                e["function"].as_str().expect("function").to_string(),
+                &e["return_value"],
+            )
+        })
+        .collect();
+    assert_eq!(returns.len(), 1);
+    let (name, rv) = &returns[0];
+    assert_eq!(name, "compute");
+    assert_eq!(rv["kind"].as_str(), Some("Int"));
+    assert_eq!(rv["i"].as_i64(), Some(22));
+    // The CloseFrame's return value must carry the output's
+    // declared type (u64, NOT u32) -- this is the post-cast type id
+    // matching r4's id, distinct from the pre-cast registers'.
+    assert_eq!(
+        rv["type_id"].as_i64(),
+        Some(r4_id),
+        "return_value type id must match r4's post-cast u64 id; \
+         got rv.type_id={:?}, r4_id={r4_id}",
+        rv["type_id"]
+    );
+}
+
+// --- signature_verify_test.leo --------------------------------------------
+
+/// Records `signature_verify_test.leo` and pins the recorder's
+/// surfacing of Aleo's Schnorr signature primitive: a typed
+/// `signature` value carries the bech32m `sign1...` payload, and
+/// `sig.verify(signer, msg)` evaluates to a deterministic
+/// stand-in `true` while emitting an io_event tagged
+/// `LeoSignatureVerify` with the verbatim source-level expression.
+///
+/// The test pins:
+///   1. The `signature` and `address` lang-types are registered as
+///      distinct `TypeId`s so downstream tooling can disambiguate
+///      bech32m payloads from generic strings.
+///   2. The `verify` instance method surfaces the call as a single
+///      io_event with `EventLogKind::Read` (`ioFileOp`) and the
+///      verbatim source text.
+///   3. `verify_payment` returns `Bool(true)` and `main` returns
+///      the propagated `Bool(true)`.
+#[test]
+fn test_signature_verify_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_signature_verify_test_via_ct_print_full",
+        "signature_verify_test.leo",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["main", "verify_payment"]);
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    // 1 absolute top-level step + 1 function-entry step at
+    // verify_payment's signature line + 1 step for the `ok` binding
+    // + 1 step at verify_payment's return line + 3 steps for main's
+    // sig/signer/result let-bindings + 1 step at main's return line
+    // = 8 step events.
+    assert_eq!(counts["steps"].as_u64(), Some(8), "steps; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(1),
+        "io_events; counts={counts}"
+    );
+
+    assert_step_indices_monotonic(&doc);
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["verify_payment".to_string()]
+    );
+
+    // ----- Type registration: `signature` and `address` must surface --
+    // The registered types table also contains the writer's pre-
+    // registered Int types and opaque auto-numbered placeholders
+    // (`type_N`); we pin the domain-relevant lang types by
+    // intersecting with the closed set we care about, then
+    // asserting on the sorted intersection.  Strict equality
+    // guarantees both names are present without depending on the
+    // exact ordering or count of the auto-numbered placeholders.
+    let types: Vec<String> = doc["types"]
+        .as_array()
+        .expect("types array")
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect();
+    let bech_types: Vec<String> = {
+        let mut filtered: Vec<String> = types
+            .iter()
+            .filter(|t| t.as_str() == "signature" || t.as_str() == "address")
+            .cloned()
+            .collect();
+        filtered.sort();
+        filtered.dedup();
+        filtered
+    };
+    assert_eq!(
+        bech_types,
+        vec!["address".to_string(), "signature".to_string()]
+    );
+
+    // ----- Decoded variable values -----------------------------------
+    // Walk every step variable and pin (varname, kind, payload).
+    // sig (String, sign1abcdefghij), signer (String, aleo1...),
+    // msg (Int, 7), ok (Bool true), result (Bool true).
+    let events = doc["events"].as_array().expect("events array");
+    let observed: Vec<(String, String, String)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .map(|v| {
+            let name = v["varname"].as_str().expect("varname").to_string();
+            let kind = v["value"]["kind"].as_str().expect("kind").to_string();
+            let payload = match kind.as_str() {
+                "String" => v["value"]["text"].as_str().expect("text").to_string(),
+                "Int" => v["value"]["i"].as_i64().expect("Int.i").to_string(),
+                "Bool" => v["value"]["b"].as_bool().expect("Bool.b").to_string(),
+                other => panic!(
+                    "unexpected ValueRecord kind `{other}` for var `{name}`; \
+                     extend this test if a new variant has landed"
+                ),
+            };
+            (name, kind, payload)
+        })
+        .collect();
+    assert_eq!(
+        observed,
+        vec![
+            (
+                "sig".to_string(),
+                "String".to_string(),
+                "sign1abcdefghij".to_string()
+            ),
+            (
+                "signer".to_string(),
+                "String".to_string(),
+                "aleo1qnr4dkkvkgfqph0vzc3y6z2eu975wnpz2925ntjccd76cqsnpdjsdhgg6c".to_string()
+            ),
+            (
+                "sig".to_string(),
+                "String".to_string(),
+                "sign1abcdefghij".to_string()
+            ),
+            (
+                "signer".to_string(),
+                "String".to_string(),
+                "aleo1qnr4dkkvkgfqph0vzc3y6z2eu975wnpz2925ntjccd76cqsnpdjsdhgg6c".to_string()
+            ),
+            ("msg".to_string(), "Int".to_string(), "7".to_string()),
+            (
+                "sig".to_string(),
+                "String".to_string(),
+                "sign1abcdefghij".to_string()
+            ),
+            (
+                "signer".to_string(),
+                "String".to_string(),
+                "aleo1qnr4dkkvkgfqph0vzc3y6z2eu975wnpz2925ntjccd76cqsnpdjsdhgg6c".to_string()
+            ),
+            ("msg".to_string(), "Int".to_string(), "7".to_string()),
+            ("ok".to_string(), "Bool".to_string(), "true".to_string()),
+            ("result".to_string(), "Bool".to_string(), "true".to_string()),
+        ]
+    );
+
+    // ----- Per-parameter signature/address type id distinction --------
+    // Walk every step variable, collect (varname, type_id), assert
+    // sig and signer have distinct type ids (signature vs address)
+    // and that msg's type id differs from both (it's `field`).
+    let var_type_ids: Vec<(String, i64)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .map(|v| {
+            (
+                v["varname"].as_str().expect("varname").to_string(),
+                v["value"]["type_id"].as_i64().expect("type_id"),
+            )
+        })
+        .collect();
+    let id_for = |name: &str| -> i64 {
+        var_type_ids
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, id)| *id)
+            .unwrap_or_else(|| panic!("missing var {name} in type-id map: {var_type_ids:?}"))
+    };
+    let sig_id = id_for("sig");
+    let signer_id = id_for("signer");
+    let msg_id = id_for("msg");
+    assert_ne!(
+        sig_id, signer_id,
+        "signature and address must have distinct type ids; got sig={sig_id}, signer={signer_id}"
+    );
+    assert_ne!(
+        sig_id, msg_id,
+        "signature and field must have distinct type ids; got sig={sig_id}, msg={msg_id}"
+    );
+
+    // ----- io_event: exactly one LeoSignatureVerify ------------------
+    let io_events: Vec<(String, String)> = events
+        .iter()
+        .filter(|e| e["kind"] == "io")
+        .map(|e| {
+            (
+                e["io_kind"].as_str().unwrap_or("").to_string(),
+                e["text"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        io_events,
+        vec![(
+            "ioFileOp".to_string(),
+            "sig.verify(signer, msg)".to_string()
+        )]
+    );
+
+    // ----- Per-call return values --------------------------------------
+    let returns: Vec<(String, &serde_json::Value)> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            (
+                e["function"].as_str().expect("function").to_string(),
+                &e["return_value"],
+            )
+        })
+        .collect();
+    assert_eq!(returns.len(), 1);
+    let (vp_name, vp_rv) = &returns[0];
+    assert_eq!(vp_name, "verify_payment");
+    assert_eq!(vp_rv["kind"].as_str(), Some("Bool"));
+    assert_eq!(vp_rv["b"].as_bool(), Some(true));
+}
+
+// --- public_private_io_test.leo -------------------------------------------
+
+/// Records `public_private_io_test.leo` and pins the recorder's
+/// surfacing of Aleo's parameter visibility modifiers (`public` /
+/// default-private).  When a parameter carries a leading `public`
+/// keyword, the structured parser appends a `.public` suffix to
+/// the declared type name; the writer registers a distinct
+/// `TypeId` for the suffixed form, and `emit_call_trace` re-tags
+/// each formal parameter's `Value::Int` with the declared type so
+/// the on-chain-visible witnesses share a type id distinct from
+/// the witness-only inputs.
+///
+/// The test pins:
+///   1. The function table contains both `main` and `payment`.
+///   2. The registered types table contains `u64.public` (the
+///      visibility-tagged variant) and `u64` (the bare variant).
+///   3. The two `public` parameters (`sender`, `amount`) share a
+///      type id; the default-private `secret` parameter has a
+///      distinct type id; and `payment` returns 7 + 100 + 5 = 112.
+#[test]
+fn test_public_private_io_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_public_private_io_test_via_ct_print_full",
+        "public_private_io_test.leo",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["main", "payment"]);
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    // 1 absolute top-level step + 1 function-entry step at payment's
+    // signature line + 2 step events for the two let-bindings
+    // (sender_check, total) inside payment + 1 step at payment's
+    // return line + 1 step at main's return line = 6 step events.
+    assert_eq!(counts["steps"].as_u64(), Some(6), "steps; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    assert_step_indices_monotonic(&doc);
+    assert_eq!(observed_call_sequence(&doc), vec!["payment".to_string()]);
+
+    // ----- Visibility-tagged type registration ------------------------
+    // The structured parser emits `u64.public` as the declared type
+    // for every `public` parameter; the writer registers it as a
+    // distinct `TypeId`.  Both the suffixed form and the bare form
+    // must surface in the types table so downstream tooling can
+    // distinguish on-chain-visible inputs from witness-only inputs.
+    // The registered types table also contains the writer's pre-
+    // registered Int types and opaque auto-numbered placeholders
+    // (`type_N`); we pin the domain-relevant lang types by
+    // intersecting with the closed set we care about, then
+    // asserting on the sorted intersection so the strict equality
+    // guarantees both names are present without depending on the
+    // exact ordering or count of the placeholders.
+    let types: Vec<String> = doc["types"]
+        .as_array()
+        .expect("types array")
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect();
+    let visibility_types: Vec<String> = {
+        let mut filtered: Vec<String> = types
+            .iter()
+            .filter(|t| t.as_str() == "u64" || t.as_str() == "u64.public")
+            .cloned()
+            .collect();
+        filtered.sort();
+        filtered.dedup();
+        filtered
+    };
+    assert_eq!(
+        visibility_types,
+        vec!["u64".to_string(), "u64.public".to_string()]
+    );
+
+    // ----- Per-parameter type id distinction -------------------------
+    // Walk every step variable, collect (varname, type_id), and
+    // assert the public parameters (`sender`, `amount`) share a
+    // type id distinct from the private `secret`.  We don't pin
+    // the absolute id values (writer-assigned) -- only that the
+    // public/private split is reflected in the type ids.
+    let events = doc["events"].as_array().expect("events array");
+    let var_type_ids: Vec<(String, i64)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .map(|v| {
+            (
+                v["varname"].as_str().expect("varname").to_string(),
+                v["value"]["type_id"].as_i64().expect("type_id"),
+            )
+        })
+        .collect();
+    let id_for = |name: &str| -> i64 {
+        var_type_ids
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, id)| *id)
+            .unwrap_or_else(|| panic!("missing var {name} in type-id map: {var_type_ids:?}"))
+    };
+    let sender_id = id_for("sender");
+    let amount_id = id_for("amount");
+    let secret_id = id_for("secret");
+    assert_eq!(
+        sender_id, amount_id,
+        "both public params must share a type id; got sender={sender_id}, amount={amount_id}"
+    );
+    assert_ne!(
+        sender_id, secret_id,
+        "public param (sender) must have a type id distinct from \
+         the default-private param (secret); got sender={sender_id}, secret={secret_id}"
+    );
+
+    // ----- Decoded variable values + return ---------------------------
+    // sender/amount/secret each emit twice (entry-step + body
+    // re-emit); sender_check binds to the formal `sender` value;
+    // total = sender_check + amount + secret = 7 + 100 + 5 = 112.
+    assert_eq!(
+        observed_var_sequence(&doc),
+        vec![
+            ("sender".to_string(), 7),
+            ("amount".to_string(), 100),
+            ("secret".to_string(), 5),
+            ("sender".to_string(), 7),
+            ("amount".to_string(), 100),
+            ("secret".to_string(), 5),
+            ("sender_check".to_string(), 7),
+            ("total".to_string(), 112),
+        ]
+    );
+
+    let returns: Vec<(String, i64)> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let name = e["function"].as_str().expect("function").to_string();
+            let rv = &e["return_value"];
+            assert_eq!(
+                rv["kind"].as_str(),
+                Some("Int"),
+                "return value should decode as Int; got {rv}"
+            );
+            (name, rv["i"].as_i64().expect("Int.i"))
+        })
+        .collect();
+    assert_eq!(returns, vec![("payment".to_string(), 112)]);
+}
+
+// --- multi_test_entry_test.leo --------------------------------------------
+
+/// Records `multi_test_entry_test.leo`, a multi-entry-point program
+/// with three independent transitions (`deposit` / `withdraw` /
+/// `query`) and NO `main`.  The recorder's structured evaluator
+/// previously emitted only the first reachable function from
+/// `main`; the M11 R3 work extends it so that, in the absence of
+/// `main`, every top-level `transition` is executed in declaration
+/// order as its own entry point.  Each one surfaces a balanced
+/// Call/Return pair so the trace exposes the three transitions
+/// distinctly.
+///
+/// Synthesised default arguments (zeroed for numeric formals) keep
+/// the execution well-defined; the canonical answers under
+/// (balance=0, amount=0) are:
+///   deposit(0, 0)  -> credited = 0 + 0 = 0
+///   withdraw(0, 0) -> debited  = 0 - 0 = 0
+///   query(0)       -> view     = 0 + 1 = 1
+#[test]
+fn test_multi_test_entry_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_multi_test_entry_test_via_ct_print_full",
+        "multi_test_entry_test.leo",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Function table: every transition appears, no `main` --------
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["deposit", "withdraw", "query"]);
+
+    let counts = &doc["counts"];
+    assert_eq!(
+        counts["calls"].as_u64(),
+        Some(3),
+        "exactly 3 calls (one per transition entry); counts={counts}"
+    );
+    // Each transition emits: entry-step (formal param re-emit) + 1
+    // binding step (credited / debited / view) + return-line step.
+    // deposit: 3 steps, withdraw: 3 steps, query: 3 steps, plus 1
+    // synthesised <toplevel> trailing step = 10 step events.
+    assert_eq!(counts["steps"].as_u64(), Some(10), "steps; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence -----------------------------------------------
+    // deposit / withdraw / query, in source-declaration order.
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "deposit".to_string(),
+            "withdraw".to_string(),
+            "query".to_string()
+        ]
+    );
+
+    // ----- Exit order: same as entry order (no nesting) ---------------
+    let events = doc["events"].as_array().expect("events array");
+    let exit_sequence: Vec<&str> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .filter_map(|e| e["function"].as_str())
+        .collect();
+    assert_eq!(exit_sequence, vec!["deposit", "withdraw", "query"]);
+
+    // ----- Per-call return values --------------------------------------
+    // All synthesised inputs are 0u32; deposit/withdraw return 0;
+    // query returns 1 (the `+1u32` constant in its body).
+    let returns: Vec<(String, i64)> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let name = e["function"].as_str().expect("function").to_string();
+            let rv = &e["return_value"];
+            assert_eq!(
+                rv["kind"].as_str(),
+                Some("Int"),
+                "return value should decode as Int; got {rv}"
+            );
+            (name, rv["i"].as_i64().expect("Int.i"))
+        })
+        .collect();
+    assert_eq!(
+        returns,
+        vec![
+            ("deposit".to_string(), 0),
+            ("withdraw".to_string(), 0),
+            ("query".to_string(), 1),
+        ]
+    );
+
+    // ----- Variable sequence ------------------------------------------
+    // Each transition emits its formal parameter(s) twice (entry-step +
+    // body-binding step) and then its local binding.
+    assert_eq!(
+        observed_var_sequence(&doc),
+        vec![
+            ("balance".to_string(), 0),
+            ("amount".to_string(), 0),
+            ("balance".to_string(), 0),
+            ("amount".to_string(), 0),
+            ("credited".to_string(), 0),
+            ("balance".to_string(), 0),
+            ("amount".to_string(), 0),
+            ("balance".to_string(), 0),
+            ("amount".to_string(), 0),
+            ("debited".to_string(), 0),
+            ("balance".to_string(), 0),
+            ("balance".to_string(), 0),
+            ("view".to_string(), 1),
+        ]
+    );
+}
+
+// --- commitment_test.leo --------------------------------------------------
+
+/// Records `commitment_test.leo` and pins the full event shape for
+/// Aleo's commitment-scheme builtins (`BHP256::commit_to_field`,
+/// `Pedersen64::commit_to_field`).  `commit_to_*` calls flow
+/// through the same hash-builtin path as `hash_to_*`: each call
+/// surfaces an io_event of `EventLogKind::Read` with the family-
+/// tagged metadata (`LeoBhpHash` / `LeoPedersenHash` -- the
+/// commitment family is encoded in the io_event's `metadata`
+/// field, which ct-print --full does NOT expose so the test pins
+/// only the visible (io_kind, text) pair) and the verbatim source
+/// text.
+///
+/// The reveal_check transition exercises the equality comparison
+/// path: `fresh == commitment` returns `Value::Bool` which round-
+/// trips as `ValueRecord::Bool` through ct-print --full.
+#[test]
+fn test_commitment_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_commitment_test_via_ct_print_full",
+        "commitment_test.leo",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["main", "commit_secret", "reveal_check"]);
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(12), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
+    // 3 io_events: 2 commit_to_field calls inside commit_secret +
+    // 1 commit_to_field call inside reveal_check.
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(3),
+        "io_events; counts={counts}"
+    );
+
+    assert_step_indices_monotonic(&doc);
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["commit_secret".to_string(), "reveal_check".to_string()]
+    );
+
+    // The native curve types `field` and `scalar` must surface in
+    // the registered types table -- both arguments and return values
+    // of the commit builtins carry these types.  The registered
+    // table also contains the writer's pre-registered Int types
+    // (`u32`/`u64`/`i32`/`i64`/`bool`) and a handful of opaque
+    // auto-numbered placeholders (`type_N`).  We pin only the
+    // domain-relevant lang types here by intersecting the recorded
+    // table with the closed set we care about, then asserting on
+    // the sorted intersection -- the strict equality guarantees
+    // both names are present (and that no related lang type is
+    // accidentally missing) without depending on the exact ordering
+    // or count of the auto-numbered placeholders.
+    let types: Vec<String> = doc["types"]
+        .as_array()
+        .expect("types array")
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect();
+    let curve_types: Vec<String> = {
+        let mut filtered: Vec<String> = types
+            .iter()
+            .filter(|t| t.as_str() == "field" || t.as_str() == "scalar")
+            .cloned()
+            .collect();
+        filtered.sort();
+        filtered.dedup();
+        filtered
+    };
+    assert_eq!(curve_types, vec!["field".to_string(), "scalar".to_string()]);
+
+    // ----- Decoded variable sequence (Int + Bool payloads) -----------
+    // commit_secret(7field, 5scalar):
+    //   secret=7, randomness=5 (entry-step + body re-emit)
+    //   bhp_c = sum-stub = 12 (typed field)
+    //   ped_c = sum-stub = 12 (typed field)
+    // reveal_check(12field, 7field, 5scalar):
+    //   commitment=12, secret=7, randomness=5 (entry-step + body re-emit)
+    //   fresh = sum-stub = 12 (typed field)
+    //   ok    = (fresh == commitment) = true (Bool)
+    // main:
+    //   c = 12 (Int field, captured via `commit_secret` return)
+    //   verified = true (Bool)
+    let events = doc["events"].as_array().expect("events array");
+    let observed: Vec<(String, String, serde_json::Value)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .map(|v| {
+            let name = v["varname"].as_str().expect("varname").to_string();
+            let kind = v["value"]["kind"].as_str().expect("kind").to_string();
+            let payload = match kind.as_str() {
+                "Int" => v["value"]["i"].clone(),
+                "Bool" => v["value"]["b"].clone(),
+                other => panic!(
+                    "unexpected ValueRecord kind `{other}` for var `{name}`; \
+                     extend this test if a new variant has landed"
+                ),
+            };
+            (name, kind, payload)
+        })
+        .collect();
+    let expected: Vec<(String, String, serde_json::Value)> = vec![
+        ("secret".into(), "Int".into(), serde_json::json!(7)),
+        ("randomness".into(), "Int".into(), serde_json::json!(5)),
+        ("secret".into(), "Int".into(), serde_json::json!(7)),
+        ("randomness".into(), "Int".into(), serde_json::json!(5)),
+        ("bhp_c".into(), "Int".into(), serde_json::json!(12)),
+        ("ped_c".into(), "Int".into(), serde_json::json!(12)),
+        ("c".into(), "Int".into(), serde_json::json!(12)),
+        ("commitment".into(), "Int".into(), serde_json::json!(12)),
+        ("secret".into(), "Int".into(), serde_json::json!(7)),
+        ("randomness".into(), "Int".into(), serde_json::json!(5)),
+        ("commitment".into(), "Int".into(), serde_json::json!(12)),
+        ("secret".into(), "Int".into(), serde_json::json!(7)),
+        ("randomness".into(), "Int".into(), serde_json::json!(5)),
+        ("fresh".into(), "Int".into(), serde_json::json!(12)),
+        ("ok".into(), "Bool".into(), serde_json::json!(true)),
+        ("verified".into(), "Bool".into(), serde_json::json!(true)),
+    ];
+    assert_eq!(observed, expected);
+
+    // ----- io_events: BHP / Pedersen commit_to_field calls in order
+    let io_events: Vec<(String, String)> = events
+        .iter()
+        .filter(|e| e["kind"] == "io")
+        .map(|e| {
+            (
+                e["io_kind"].as_str().unwrap_or("").to_string(),
+                e["text"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        io_events,
+        vec![
+            (
+                "ioFileOp".to_string(),
+                "BHP256::commit_to_field(secret, randomness)".to_string()
+            ),
+            (
+                "ioFileOp".to_string(),
+                "Pedersen64::commit_to_field(secret, randomness)".to_string()
+            ),
+            (
+                "ioFileOp".to_string(),
+                "BHP256::commit_to_field(secret, randomness)".to_string()
+            ),
+        ]
+    );
+
+    // ----- Per-call return values --------------------------------------
+    // commit_secret -> 12 (Int, typed field).
+    // reveal_check -> true (Bool).
+    let returns: Vec<(String, &serde_json::Value)> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            (
+                e["function"].as_str().expect("function").to_string(),
+                &e["return_value"],
+            )
+        })
+        .collect();
+    assert_eq!(returns.len(), 2);
+
+    let (cs_name, cs_rv) = &returns[0];
+    assert_eq!(cs_name, "commit_secret");
+    assert_eq!(cs_rv["kind"].as_str(), Some("Int"));
+    assert_eq!(cs_rv["i"].as_i64(), Some(12));
+
+    let (rc_name, rc_rv) = &returns[1];
+    assert_eq!(rc_name, "reveal_check");
+    assert_eq!(rc_rv["kind"].as_str(), Some("Bool"));
+    assert_eq!(rc_rv["b"].as_bool(), Some(true));
+}
