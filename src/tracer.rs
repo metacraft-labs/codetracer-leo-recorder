@@ -374,14 +374,8 @@ impl LeoTracer {
 
         // CTFS-only writer — events stream lives in `trace.bin`.
         let events_path = out_dir.join("trace.bin");
-        let metadata_path = out_dir.join("trace_metadata.json");
-        let paths_path = out_dir.join("trace_paths.json");
 
         TraceWriter::begin_writing_trace_events(&mut *tracer.writer, &events_path)
-            .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::begin_writing_trace_metadata(&mut *tracer.writer, &metadata_path)
-            .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::begin_writing_trace_paths(&mut *tracer.writer, &paths_path)
             .map_err(|e| eyre!("{e}"))?;
 
         // -- 8. Start the trace --
@@ -408,9 +402,9 @@ impl LeoTracer {
 
         // -- 10. Finish writing --
         TraceWriter::finish_writing_trace_events(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
-        TraceWriter::finish_writing_trace_metadata(&mut *tracer.writer)
+        tracer.writer
+            .write_meta_dat("codetracer-leo-recorder")
             .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::finish_writing_trace_paths(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
         tracer.writer.close().map_err(|e| eyre!("{e}"))?;
 
         Ok(())
@@ -1346,22 +1340,18 @@ fn write_error_trace(
 
     // CTFS-only writer — events stream lives in `trace.bin`.
     let events_path = out_dir.join("trace.bin");
-    let metadata_path = out_dir.join("trace_metadata.json");
-    let paths_path = out_dir.join("trace_paths.json");
 
     TraceWriter::begin_writing_trace_events(&mut *writer, &events_path)
         .map_err(|e| eyre!("{e}"))?;
-    TraceWriter::begin_writing_trace_metadata(&mut *writer, &metadata_path)
-        .map_err(|e| eyre!("{e}"))?;
-    TraceWriter::begin_writing_trace_paths(&mut *writer, &paths_path).map_err(|e| eyre!("{e}"))?;
 
     TraceWriter::start(&mut *writer, source_path, Line(1));
     TraceWriter::register_special_event(&mut *writer, EventLogKind::Error, metadata, message);
     TraceWriter::register_return(&mut *writer, NONE_VALUE);
 
     TraceWriter::finish_writing_trace_events(&mut *writer).map_err(|e| eyre!("{e}"))?;
-    TraceWriter::finish_writing_trace_metadata(&mut *writer).map_err(|e| eyre!("{e}"))?;
-    TraceWriter::finish_writing_trace_paths(&mut *writer).map_err(|e| eyre!("{e}"))?;
+    writer
+        .write_meta_dat("codetracer-leo-recorder")
+        .map_err(|e| eyre!("{e}"))?;
     writer.close().map_err(|e| eyre!("{e}"))?;
 
     Ok(())
