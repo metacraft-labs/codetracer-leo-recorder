@@ -638,6 +638,7 @@ impl LeoTracer {
     /// `call_args` carries the `(formal-name, value)` pairs that the
     /// caller staged before entering this function.  For the entry
     /// point (`main` -- merged into `<toplevel>`), pass an empty slice.
+    #[allow(clippy::too_many_arguments)]
     fn emit_call_trace(
         &mut self,
         source_path: &Path,
@@ -1211,6 +1212,7 @@ impl LeoTracer {
     ///
     /// When `is_entry_point` is true, Call/Return events are suppressed so the
     /// function body runs at depth 0 under `<toplevel>`.
+    #[allow(clippy::too_many_arguments)]
     fn emit_function_trace(
         &mut self,
         source_path: &Path,
@@ -2857,7 +2859,7 @@ fn parse_typed_literal(s: &str) -> Option<i64> {
 
 /// One Leo statement after structured parsing.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[allow(dead_code, clippy::enum_variant_names)]
 enum Stmt {
     Let {
         mutable: bool,
@@ -2957,13 +2959,7 @@ impl Value {
     fn as_int(&self) -> i64 {
         match self {
             Value::Int(i, _) => *i,
-            Value::Bool(b) => {
-                if *b {
-                    1
-                } else {
-                    0
-                }
-            }
+            Value::Bool(b) => i64::from(*b),
             _ => 0,
         }
     }
@@ -3224,7 +3220,7 @@ fn parse_leo_program(source: &str) -> LeoProgram {
         let mut col = name_end;
         let mut current = lines[k];
         loop {
-            let bytes = current[col..].as_bytes();
+            let bytes = &current.as_bytes()[col..];
             let mut j = 0;
             while j < bytes.len() {
                 let ch = bytes[j] as char;
@@ -3829,6 +3825,7 @@ fn execute_leo_function(prog: &LeoProgram, func: &LeoFunc, args: &[(String, Valu
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_block(
     prog: &LeoProgram,
     block: &[Stmt],
