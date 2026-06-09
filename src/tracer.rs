@@ -4996,12 +4996,15 @@ fn find_top_level_substr(expr: &str, needle: &str) -> Option<usize> {
             '}' => depth_brace -= 1,
             _ => {}
         }
-        if depth_paren == 0 && depth_brack == 0 && depth_brace == 0 {
-            if i + nbytes.len() <= bytes.len() && &bytes[i..i + nbytes.len()] == nbytes {
-                // Avoid matching `=` inside `==` when caller asked for
-                // `=` (we don't, but be defensive).
-                return Some(i);
-            }
+        if depth_paren == 0
+            && depth_brack == 0
+            && depth_brace == 0
+            && i + nbytes.len() <= bytes.len()
+            && &bytes[i..i + nbytes.len()] == nbytes
+        {
+            // Avoid matching `=` inside `==` when caller asked for
+            // `=` (we don't, but be defensive).
+            return Some(i);
         }
         i += 1;
     }
@@ -5153,10 +5156,8 @@ fn collect_callees_in_expr(prog: &LeoProgram, expr: &str, out: &mut Vec<String>)
             while j < bytes.len() && (bytes[j] as char).is_whitespace() {
                 j += 1;
             }
-            if j < bytes.len() && bytes[j] == b'(' {
-                if prog.by_name.contains_key(name) {
-                    out.push(name.to_string());
-                }
+            if j < bytes.len() && bytes[j] == b'(' && prog.by_name.contains_key(name) {
+                out.push(name.to_string());
             }
         } else {
             i += 1;
