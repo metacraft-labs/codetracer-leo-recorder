@@ -171,8 +171,8 @@ jobs:
           set -e
           cd -
           if [ "$CT_REF" != "main" ]; then
-            git -C "$DEST" fetch origin "$CT_REF"
-            git -C "$DEST" checkout "$CT_REF"
+            git -C "$DEST" fetch --no-recurse-submodules origin "$CT_REF"
+            git -C "$DEST" checkout --no-recurse-submodules "$CT_REF"
           fi
 
       - name: Clone codetracer-vscode-extension
