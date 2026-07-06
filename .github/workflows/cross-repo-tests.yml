@@ -74,6 +74,11 @@ jobs:
         with:
           env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}
+          substituters: ${{ vars.SUBSTITUTERS }}
+          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
+          attic-token: ${{ secrets.ATTIC_TOKEN }}
+          attic-cache: ${{ vars.ATTIC_CACHE }}
+          attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
           siblings: |
             codetracer=${{ github.event.inputs.codetracer_ref || github.event.client_payload.codetracer_ref }}
             codetracer-vscode-extension=${{ github.event.inputs.vscode_extension_ref || github.event.client_payload.vscode_extension_ref }}
@@ -174,6 +179,7 @@ jobs:
       - name: Record Leo trace fixture
         run: |
           cd "$GITHUB_WORKSPACE/../codetracer-vscode-extension"
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/../codetracer-leo-recorder/target"
           FORCE=1 bash scripts/prepare-leo-fixture.sh
 
       - name: Run Leo smoke tests
@@ -194,7 +200,11 @@ jobs:
           EXT_DIAG="$GITHUB_WORKSPACE/../codetracer-vscode-extension/test/wdio/diagnostics"
           if [ -d "$EXT_DIAG" ]; then
             mkdir -p "$GITHUB_WORKSPACE/wdio-diagnostics"
-            cp -r "$EXT_DIAG"/* "$GITHUB_WORKSPACE/wdio-diagnostics/"
+            shopt -s nullglob
+            files=("$EXT_DIAG"/*)
+            if [ "${#files[@]}" -gt 0 ]; then
+              cp -r "${files[@]}" "$GITHUB_WORKSPACE/wdio-diagnostics/"
+            fi
           fi
 
       - name: Upload diagnostics on failure
