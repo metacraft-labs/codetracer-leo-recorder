@@ -71,6 +71,7 @@
 ## recorder records them directly, no external Leo compiler is needed.
 
 import repro_project_dsl
+import repro_dsl_stdlib/foreign_env
 import repro_dsl_stdlib/packages/sh
 
 package codetracer_leo_recorder:
@@ -120,6 +121,9 @@ package codetracer_leo_recorder:
     name: "codetracer-leo-recorder"
 
   devEnv:
+    when not defined(windows):
+      useFlakeDevShell()
+
     activity "default"
 
   build:
