@@ -16,14 +16,13 @@ use std::path::Path;
 
 use codetracer_trace_types::{Line, TypeKind, ValueRecord, NONE_VALUE};
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
-use codetracer_trace_writer_nim::{create_trace_writer, TraceEventsFileFormat};
 use eyre::{eyre, Context, Result};
 
 // The recorder is CTFS-only per `Recorder-CLI-Conventions.md` §4 (see
-// `codetracer-specs`).  Pin every `create_trace_writer` call site to the
-// canonical multi-stream container so the replay path cannot drift away
-// from the contract enforced on the record path.
-const CTFS_FORMAT: TraceEventsFileFormat = TraceEventsFileFormat::Ctfs;
+// `codetracer-specs`).  The replay path takes its writer from the same
+// `line_counted_writer` as the record path, so it cannot drift away from
+// the canonical multi-stream container.
+use crate::line_counts::{line_counted_writer, LineCountedPaths};
 
 use crate::tracer::{
     parse_aleo_program, resolve_operand, AleoFunction, AleoInstruction, FunctionResult,
@@ -312,22 +311,21 @@ pub fn replay_deployed_program(
     std::fs::write(&source_path, &deployed.source)
         .with_context(|| format!("failed to write source file: {}", source_path.display()))?;
 
-    // Create trace writer (CTFS only).
-    let program_str = source_path.to_string_lossy().to_string();
-    let mut writer = create_trace_writer(&program_str, &[], CTFS_FORMAT);
-
     // CTFS-only writer — events stream lives in `trace.bin`.
     let events_path = out_dir.join("trace.bin");
 
-    TraceWriter::begin_writing_trace_events(&mut *writer, &events_path)
-        .map_err(|e| eyre!("{e}"))?;
+    // Create trace writer (CTFS only), stating the deployed program's line
+    // count — it is the only path the replay's steps name.
+    let program_str = source_path.to_string_lossy().to_string();
+    let mut writer = line_counted_writer(&program_str, &events_path)?;
+    LineCountedPaths::default().register(&mut writer, &source_path, &deployed.source)?;
 
-    TraceWriter::start(&mut *writer, &source_path, Line(1));
+    TraceWriter::start(&mut writer, &source_path, Line(1));
 
     // Register common types.
     let mut type_ids = HashMap::new();
     for type_name in &["u32", "u64", "i32", "i64", "field", "bool"] {
-        let type_id = TraceWriter::ensure_type_id(&mut *writer, TypeKind::Int, type_name);
+        let type_id = TraceWriter::ensure_type_id(&mut writer, TypeKind::Int, type_name);
         type_ids.insert(type_name.to_string(), type_id);
     }
 
@@ -353,7 +351,7 @@ pub fn replay_deployed_program(
 
     // Step into the function.
     let fn_id = TraceWriter::ensure_function_id(
-        &mut *writer,
+        &mut writer,
         &config.function_name,
         &source_path,
         Line(func_start_line),
@@ -382,10 +380,10 @@ pub fn replay_deployed_program(
         } else {
             NONE_VALUE
         };
-        TraceWriter::arg(&mut *writer, &arg_name, arg_value);
+        TraceWriter::arg(&mut writer, &arg_name, arg_value);
     }
 
-    TraceWriter::register_call(&mut *writer, fn_id, vec![]);
+    TraceWriter::register_call(&mut writer, fn_id, vec![]);
 
     // Emit value events for registers from the target function's result.
     if let Some(result) = results.get(&config.function_name) {
@@ -399,7 +397,7 @@ pub fn replay_deployed_program(
             let value = result.registers[&reg_idx];
 
             // Step to the instruction line.
-            TraceWriter::register_step(&mut *writer, &source_path, Line(instr_line));
+            TraceWriter::register_step(&mut writer, &source_path, Line(instr_line));
 
             // Emit the register value.
             let var_name = format!("r{}", reg_idx);
@@ -407,15 +405,15 @@ pub fn replay_deployed_program(
                 i: value,
                 type_id: u32_type_id,
             };
-            TraceWriter::register_variable_with_full_value(&mut *writer, &var_name, value_record);
+            TraceWriter::register_variable_with_full_value(&mut writer, &var_name, value_record);
         }
     }
 
     // Return from the function.
-    TraceWriter::register_return(&mut *writer, NONE_VALUE);
+    TraceWriter::register_return(&mut writer, NONE_VALUE);
 
     // Finish writing.
-    TraceWriter::finish_writing_trace_events(&mut *writer).map_err(|e| eyre!("{e}"))?;
+    TraceWriter::finish_writing_trace_events(&mut writer).map_err(|e| eyre!("{e}"))?;
     writer
         .write_meta_dat("codetracer-leo-recorder")
         .map_err(|e| eyre!("{e}"))?;
