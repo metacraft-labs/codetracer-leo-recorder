@@ -18,4 +18,6 @@ serde_json = "1"
 tempfile = "3"
 
 [dev-dependencies]
+# Reads the recorded `paths.dat` line-count table back in tests.
+codetracer_trace_reader = { path = "../codetracer-trace-format/codetracer_trace_reader" }
 cbor4ii = { version = "1.0.0", features = ["serde1", "use_std"] }

@@ -21,15 +21,14 @@ use codetracer_trace_types::{
     NONE_VALUE,
 };
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
-use codetracer_trace_writer_nim::{create_trace_writer, TraceEventsFileFormat};
+use codetracer_trace_writer_nim::NimTraceWriter;
 use eyre::{eyre, Context, Result};
 
 // The recorder is CTFS-only per `Recorder-CLI-Conventions.md` §4 (see
-// `codetracer-specs`).  We pin every `create_trace_writer` call site to
-// this constant so the tracer surface no longer carries a `format`
-// parameter and the writer cannot accidentally drift away from the
-// canonical multi-stream container.
-const CTFS_FORMAT: TraceEventsFileFormat = TraceEventsFileFormat::Ctfs;
+// `codetracer-specs`): every writer comes from `line_counted_writer`,
+// which pins the canonical multi-stream container, so the tracer surface
+// carries no `format` parameter.
+use crate::line_counts::{line_counted_writer, LineCountedPaths};
 
 use crate::source_map::{generate_source_map, AleoSourceMap, SourceMap};
 
@@ -293,9 +292,12 @@ struct LeoFunctionDef {
 
 /// The main tracer struct that captures Leo execution traces.
 pub struct LeoTracer {
-    writer: Box<dyn TraceWriter + Send>,
+    writer: Box<NimTraceWriter>,
     /// Registered type IDs for Leo types.
     type_ids: HashMap<String, codetracer_trace_types::TypeId>,
+    /// Source files whose line counts are stated in `paths.dat`: the
+    /// program itself and every `.leo` file it imports.
+    paths: LineCountedPaths,
 }
 
 impl LeoTracer {
@@ -318,7 +320,13 @@ impl LeoTracer {
             Ok(aleo) => aleo,
             Err(error) => {
                 let message = format!("{error:#}");
-                write_error_trace(source_path, out_dir, "leo_compile_error", &message)?;
+                write_error_trace(
+                    source_path,
+                    source_code,
+                    out_dir,
+                    "leo_compile_error",
+                    &message,
+                )?;
                 return Err(error);
             }
         };
@@ -343,7 +351,13 @@ impl LeoTracer {
             Ok(results) => results,
             Err(error) => {
                 let message = format!("{error:#}");
-                write_error_trace(source_path, out_dir, "avm_runtime_error", &message)?;
+                write_error_trace(
+                    source_path,
+                    source_code,
+                    out_dir,
+                    "avm_runtime_error",
+                    &message,
+                )?;
                 return Err(error);
             }
         };
@@ -362,12 +376,6 @@ impl LeoTracer {
         }
 
         // -- 6. Create the trace writer (CTFS only) --
-        let program_str = source_path.to_string_lossy();
-        let mut tracer = LeoTracer {
-            writer: create_trace_writer(&program_str, &[], CTFS_FORMAT),
-            type_ids: HashMap::new(),
-        };
-
         // -- 7. Initialise output files --
         std::fs::create_dir_all(out_dir)
             .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
@@ -375,8 +383,16 @@ impl LeoTracer {
         // CTFS-only writer — events stream lives in `trace.bin`.
         let events_path = out_dir.join("trace.bin");
 
-        TraceWriter::begin_writing_trace_events(&mut *tracer.writer, &events_path)
-            .map_err(|e| eyre!("{e}"))?;
+        let program_str = source_path.to_string_lossy();
+        let mut tracer = LeoTracer {
+            writer: Box::new(line_counted_writer(&program_str, &events_path)?),
+            type_ids: HashMap::new(),
+            paths: LineCountedPaths::default(),
+        };
+        // Imported files are registered as `emit_trace_events` loads them.
+        tracer
+            .paths
+            .register(&mut tracer.writer, source_path, source_code)?;
 
         // -- 8. Start the trace --
         TraceWriter::start(&mut *tracer.writer, source_path, Line(1));
@@ -471,6 +487,8 @@ impl LeoTracer {
                     continue;
                 }
             };
+            self.paths
+                .register(&mut self.writer, &import_path, &imported_src)?;
             let imported_prog = parse_leo_program(&imported_src);
             for f in imported_prog.funcs {
                 func_source_files.insert(f.name.clone(), import_path.clone());
@@ -1331,6 +1349,7 @@ impl LeoTracer {
 
 fn write_error_trace(
     source_path: &Path,
+    source_code: &str,
     out_dir: &Path,
     metadata: &str,
     message: &str,
@@ -1338,20 +1357,18 @@ fn write_error_trace(
     std::fs::create_dir_all(out_dir)
         .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
 
-    let program_str = source_path.to_string_lossy();
-    let mut writer = create_trace_writer(&program_str, &[], CTFS_FORMAT);
-
     // CTFS-only writer — events stream lives in `trace.bin`.
     let events_path = out_dir.join("trace.bin");
 
-    TraceWriter::begin_writing_trace_events(&mut *writer, &events_path)
-        .map_err(|e| eyre!("{e}"))?;
+    let program_str = source_path.to_string_lossy();
+    let mut writer = line_counted_writer(&program_str, &events_path)?;
+    LineCountedPaths::default().register(&mut writer, source_path, source_code)?;
 
-    TraceWriter::start(&mut *writer, source_path, Line(1));
-    TraceWriter::register_special_event(&mut *writer, EventLogKind::Error, metadata, message);
-    TraceWriter::register_return(&mut *writer, NONE_VALUE);
+    TraceWriter::start(&mut writer, source_path, Line(1));
+    TraceWriter::register_special_event(&mut writer, EventLogKind::Error, metadata, message);
+    TraceWriter::register_return(&mut writer, NONE_VALUE);
 
-    TraceWriter::finish_writing_trace_events(&mut *writer).map_err(|e| eyre!("{e}"))?;
+    TraceWriter::finish_writing_trace_events(&mut writer).map_err(|e| eyre!("{e}"))?;
     writer
         .write_meta_dat("codetracer-leo-recorder")
         .map_err(|e| eyre!("{e}"))?;

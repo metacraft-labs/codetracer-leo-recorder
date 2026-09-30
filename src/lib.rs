@@ -6,6 +6,7 @@
 //! CodeTracer trace format for debugging and analysis.
 
 pub mod finalize;
+pub mod line_counts;
 pub mod recorder;
 pub mod replay;
 pub mod source_map;
