@@ -1642,8 +1642,8 @@ fn test_hash_builtins_test_via_ct_print_full() {
     );
 
     // io_events: one per hash-family call, in source order.  Each
-    // surfaces as `ioFileOp` (the io_kind ct-print emits for
-    // EventLogKind::Read) and carries the verbatim source-level
+    // surfaces as `Read` (the EventLogKind the recorder writes, which
+    // ct-print names as the io_kind) and carries the verbatim source-level
     // call text.  The family-specific metadata
     // (`LeoBhpHash` / `LeoPedersenHash` / ...) is registered with
     // the writer but not exposed via ct-print --full's JSON
@@ -1662,19 +1662,19 @@ fn test_hash_builtins_test_via_ct_print_full() {
         io_events,
         vec![
             (
-                "ioFileOp".to_string(),
+                "Read".to_string(),
                 "BHP256::hash_to_field(1u32)".to_string()
             ),
             (
-                "ioFileOp".to_string(),
+                "Read".to_string(),
                 "Pedersen64::hash_to_field(2u32)".to_string()
             ),
             (
-                "ioFileOp".to_string(),
+                "Read".to_string(),
                 "Poseidon4::hash_to_field(3u32)".to_string()
             ),
             (
-                "ioFileOp".to_string(),
+                "Read".to_string(),
                 "Keccak256::hash_to_field(4u32)".to_string()
             ),
         ]
@@ -1766,7 +1766,7 @@ fn test_mapping_finalize_test_via_ct_print_full() {
 
     // io_events: one Read for `Mapping::get_or_use`, one Write
     // for `Mapping::set`, in source order.  ct-print --full
-    // surfaces these as `ioFileOp` (Read) and `ioStdout` (Write)
+    // surfaces these as `Read` and `Write`
     // respectively -- the Read/Write distinction is what
     // downstream tooling needs to reconstruct the on-chain
     // state-mutation sequence.  The op-specific metadata
@@ -1787,11 +1787,11 @@ fn test_mapping_finalize_test_via_ct_print_full() {
         io_events,
         vec![
             (
-                "ioFileOp".to_string(),
+                "Read".to_string(),
                 "Mapping::get_or_use(balances, receiver, 0u32)".to_string()
             ),
             (
-                "ioStdout".to_string(),
+                "Write".to_string(),
                 "Mapping::set(balances, receiver, updated)".to_string()
             ),
         ]
@@ -2166,7 +2166,7 @@ fn test_context_builtins_test_via_ct_print_full() {
     assert_eq!(
         io_events,
         vec![(
-            "ioStdout".to_string(),
+            "Write".to_string(),
             "Mapping::set(last_seen, self.caller, height)".to_string()
         )]
     );
@@ -2177,8 +2177,7 @@ fn test_context_builtins_test_via_ct_print_full() {
 /// Records `int_overflow_modes_test.leo` and pins the full event
 /// shape for Leo's three integer arithmetic modes near the u32
 /// boundary.  Checked overflow surfaces as a `LeoOverflow`
-/// `EventLogKind::Read` io_event (the read variant maps to
-/// `ioFileOp` in ct-print's JSON), matching the M10 `LeoAssert`
+/// `EventLogKind::Read` io_event (`Read` in ct-print's JSON), matching the M10 `LeoAssert`
 /// shape; wrapping completes silently with the wrapping result;
 /// saturating clamps to `u32::MAX`.
 #[test]
@@ -2261,7 +2260,7 @@ fn test_int_overflow_modes_test_via_ct_print_full() {
         .collect();
     assert_eq!(
         io_events,
-        vec![("ioFileOp".to_string(), "near_max + two".to_string())]
+        vec![("Read".to_string(), "near_max + two".to_string())]
     );
 
     // ----- Return value: compute returns `safe` = 3 (the non-overflowing arm)
@@ -2545,7 +2544,7 @@ fn test_async_finalize_failure_test_via_ct_print_full() {
     );
 
     // ----- io_event: exactly one LeoFinalizeAbort with EventLogKind::Error
-    // ct-print surfaces EventLogKind::Error as `ioError` in the JSON.
+    // ct-print surfaces EventLogKind::Error as `Error` in the JSON.
     let events = doc["events"].as_array().expect("events array");
     let io_events: Vec<(String, String)> = events
         .iter()
@@ -2560,7 +2559,7 @@ fn test_async_finalize_failure_test_via_ct_print_full() {
     assert_eq!(
         io_events,
         vec![(
-            "ioError".to_string(),
+            "Error".to_string(),
             "Mapping::get(balances, caller)".to_string()
         )]
     );
@@ -3066,7 +3065,7 @@ fn test_aleo_instructions_test_via_ct_print_full() {
 ///      distinct `TypeId`s so downstream tooling can disambiguate
 ///      bech32m payloads from generic strings.
 ///   2. The `verify` instance method surfaces the call as a single
-///      io_event with `EventLogKind::Read` (`ioFileOp`) and the
+///      io_event with `EventLogKind::Read` and the
 ///      verbatim source text.
 ///   3. `verify_payment` returns `Bool(true)` and `main` returns
 ///      the propagated `Bool(true)`.
@@ -3270,10 +3269,7 @@ fn test_signature_verify_test_via_ct_print_full() {
         .collect();
     assert_eq!(
         io_events,
-        vec![(
-            "ioFileOp".to_string(),
-            "sig.verify(signer, msg)".to_string()
-        )]
+        vec![("Read".to_string(), "sig.verify(signer, msg)".to_string())]
     );
 
     // ----- Per-call return values --------------------------------------
@@ -3824,15 +3820,15 @@ fn test_commitment_test_via_ct_print_full() {
         io_events,
         vec![
             (
-                "ioFileOp".to_string(),
+                "Read".to_string(),
                 "BHP256::commit_to_field(secret, randomness)".to_string()
             ),
             (
-                "ioFileOp".to_string(),
+                "Read".to_string(),
                 "Pedersen64::commit_to_field(secret, randomness)".to_string()
             ),
             (
-                "ioFileOp".to_string(),
+                "Read".to_string(),
                 "BHP256::commit_to_field(secret, randomness)".to_string()
             ),
         ]
