@@ -75,16 +75,23 @@ jobs:
         # setup-dev-env clones the siblings listed in .github/sibling-repos
         # (codetracer-trace-format, codetracer-trace-format-nim) at the
         # workspace-lock-pinned revisions before materialising the env.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@3fcbb26dd920adf6ccc64a87c6d24797ab0b5d94
         with:
           env-flavor: reprobuild
-          repro-build-pin: codex/attic-ci-cache-vars
+          repro-from-source: "true"
+          repro-build-pin: "76659f5730ecf698b1963c656494d2cb66eb256d"
           gh-token: ${{ steps.ci_token.outputs.token }}
           substituters: ${{ vars.SUBSTITUTERS }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           attic-token: ${{ secrets.ATTIC_TOKEN }}
           attic-cache: ${{ vars.ATTIC_CACHE }}
           attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
+
+      - name: Provision declared Windows packaging Python
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
 
       - name: Prepare Windows reprobuild runtime
         if: runner.os == 'Windows'
