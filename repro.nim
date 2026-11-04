@@ -273,14 +273,18 @@ package codetracer_leo_recorder:
     # of the trace-format revision ``repro.lock`` pins and against the
     # sibling checkout on disk, and requires both results to be
     # byte-identical to the committed lock (it never writes the
-    # committed lock). Like the CLI-convention script it is not a cargo
+    # committed lock). The edge runs it strict (``CT_SIBLING_CARGO_LOCKS_STRICT=1``),
+    # so a skipped check (missing sibling or registry cache) fails the
+    # edge instead of passing it; CI does not set that variable, and a
+    # non-strict skip would let an unverified lock through. Like the
+    # CLI-convention script it is not a cargo
     # target, so it is its own ``sh.shell`` execute edge. It needs no
     # built binary, so it has no ``after``. Non-cacheable: its verdict
     # depends on the sibling checkout and on the cargo registry index
     # cache, both outside this repo, so it is re-run every ``repro
     # test`` pass (matching ``just test``).
     let cargoLockVerify = shell(
-      command = "bash tests/verify-cargo-lock-matches-trace-format.sh",
+      command = "CT_SIBLING_CARGO_LOCKS_STRICT=1 bash tests/verify-cargo-lock-matches-trace-format.sh",
       actionId = "codetracer-leo-recorder.verify-cargo-lock",
       extraInputs = @[
         "tests/verify-cargo-lock-matches-trace-format.sh",

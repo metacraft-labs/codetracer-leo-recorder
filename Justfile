@@ -13,7 +13,7 @@ build-release:
 # The Cargo.lock check runs first: when the lock is stale it names the cause
 # and the remedy, where `cargo test --locked` would only refuse the lock.
 test: build-ct-print
-  bash tests/verify-cargo-lock-matches-trace-format.sh
+  CT_SIBLING_CARGO_LOCKS_STRICT=1 bash tests/verify-cargo-lock-matches-trace-format.sh
   cargo test --locked
   bash tests/verify-cli-convention-no-silent-skip.sh
 
@@ -39,7 +39,7 @@ verify-cli-convention:
 # The committed Cargo.lock must be exactly the lock of the trace-format tree
 # repro.lock pins and of the sibling checkout (see the script header).
 verify-cargo-lock:
-  bash tests/verify-cargo-lock-matches-trace-format.sh
+  CT_SIBLING_CARGO_LOCKS_STRICT=1 bash tests/verify-cargo-lock-matches-trace-format.sh
 
 lint:
   cargo fmt --check
