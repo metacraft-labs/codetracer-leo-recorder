@@ -76,6 +76,12 @@ import repro_project_dsl
 import repro_dsl_stdlib/foreign_env
 import repro_dsl_stdlib/packages/sh
 
+# The owning constructor of ``ct-print``. It lives in the sibling checkout this
+# repository's tests already resolve at the fixed path ``../codetracer-trace-format-nim``.
+import "../codetracer-trace-format-nim/build_writer_artifacts"
+
+const traceFormatNimRoot = "../codetracer-trace-format-nim"
+
 package codetracer_leo_recorder:
   defaultToolProvisioning "path"
 
@@ -198,14 +204,32 @@ package codetracer_leo_recorder:
       ],
       extraOutputs = @["target/debug/deps"])
 
+    # ---- ``ct-print`` prerequisite ------------------------------------
+    #
+    # The content tests read their recordings back with ``ct-print`` at the
+    # fixed sibling path and fail when it is absent. ``just test`` builds it
+    # first (``just build-ct-print``); here it is an edge, constructed by the
+    # sibling's own ``buildCtPrint`` so the compile flags stay in the
+    # repository that owns them. The test-run edge orders after it and names
+    # the binary as an input, so a missing or rebuilt ``ct-print`` re-runs the
+    # tests.
+    #
+    # It runs after the test build because that build's
+    # ``codetracer_trace_writer_nim`` ``build.rs`` is what installs the
+    # sibling's nimble ``requires`` (``results``, ``stew``) into the nimble
+    # path this compile resolves them from.
+    let ctPrintBuild = buildCtPrint(traceFormatNimRoot,
+                                    after = @[testsBuild.action])
+
     let testsRun = cargo.test(
       locked = true,
       actionId = "codetracer-leo-recorder.cargo-test-run",
-      after = @[testsBuild.action],
+      after = @[testsBuild.action, ctPrintBuild],
       extraInputs = @[
         "Cargo.toml", "Cargo.lock",
         "src", "tests", "test-programs",
-        "target/debug/deps"
+        "target/debug/deps",
+        ctPrintPath(traceFormatNimRoot)
       ])
 
     # ---- CLI-convention verification edge -----------------------------
