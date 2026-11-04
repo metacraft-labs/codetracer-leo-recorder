@@ -244,7 +244,7 @@ fn ctfs_reader_sees_leo_compile_error_event() {
     let events = read_events(&out_dir);
     let error_event = events
         .iter()
-        .find(|event| event["kind"].as_str() == Some("error"))
+        .find(|event| event["kind"].as_str() == Some("Error"))
         .unwrap_or_else(|| panic!("missing CTFS error event: {events:#?}"));
     let content = string_from_json_byte_array(&error_event["data"]);
     assert!(
@@ -292,7 +292,7 @@ fn ctfs_reader_sees_avm_runtime_error_event() {
     let events = read_events(&out_dir);
     let error_event = events
         .iter()
-        .find(|event| event["kind"].as_str() == Some("error"))
+        .find(|event| event["kind"].as_str() == Some("Error"))
         .unwrap_or_else(|| panic!("missing CTFS error event: {events:#?}"));
     let content = string_from_json_byte_array(&error_event["data"]);
     assert!(
