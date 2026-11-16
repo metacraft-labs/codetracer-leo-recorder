@@ -140,6 +140,36 @@ package codetracer_leo_recorder:
     # ``bash tests/verify-cargo-lock-matches-trace-format.sh`` steps
     # ``just test`` runs.
     "sh"
+    "bash"
+    "dirname"
+    "grep"
+    # ``nimble install --depsOnly`` in ``codetracer_trace_writer_nim``'s
+    # build.rs fetches the FFI's requirements with git, and the Cargo.lock
+    # check archives the pinned trace-format revision with it.
+    "git"
+    # The rest of what ``verify-cargo-lock-matches-trace-format.sh`` runs:
+    # it unpacks a ``git archive`` of the pinned trace-format revision
+    # (``tar``), builds a scratch shadow workspace (``mktemp``, ``mkdir``,
+    # ``cp``, ``ln``, ``basename``, ``rm``) and compares the re-resolved
+    # lock with the committed one (``cmp``, ``diff``, ``head``, ``cat``).
+    # Its edge's PATH is built from these declarations. The script runs on
+    # every platform, Windows included, so the list is deliberately
+    # unguarded and matches codetracer-cardano-recorder's. On Windows Repro
+    # resolves these from the Git for Windows (PortableGit / scoop) install;
+    # Repro builds older than reprobuild 22183a55f3 lack that resolution for
+    # ``mktemp``, ``cmp`` and ``diff`` and fail with "tool-resolution failed".
+    # That is a Repro defect fixed there, not a reason to drop them here.
+    "tar"
+    "mktemp"
+    "mkdir"
+    "cp"
+    "ln"
+    "basename"
+    "rm"
+    "cmp"
+    "diff"
+    "head"
+    "cat"
     # `choco pack` / `choco push` in .github/workflows/publish-chocolatey.yml.
     # Windows-guarded because Chocolatey is a Windows package manager with no
     # POSIX build, so an unguarded entry would fail to resolve on Linux/macOS.
@@ -304,5 +334,36 @@ package codetracer_leo_recorder:
         "Cargo.toml", "Cargo.lock", "repro.lock"
       ],
       cacheable = false)
+
+    # ---- Tool identities each edge runs --------------------------------
+    #
+    # A ``uses:`` declaration alone does not reach an edge: under typed
+    # provisioning an action's PATH (and pkg-config search path) is built
+    # from the tool identities registered on it. Without these the cargo
+    # edges ran with no ``nim`` / ``nimble`` on PATH, and
+    # ``codetracer_trace_writer_nim``'s build.rs failed at ``nimble install
+    # --depsOnly``; on macOS they also ran without the Nix clang wrapper, so
+    # linking zstd-sys's build script failed on ``-liconv``. Every cargo edge
+    # builds that crate, so each gets what its build scripts run: ``nimble``
+    # (which fetches with ``git``) and ``nim`` for the Nim FFI, ``capnp`` for
+    # ``codetracer_trace_format_capnp``, the C compiler for cc-rs builds
+    # (zstd-sys, ring, ...) and rustc's link step, and ``pkg-config``, which
+    # the ``pkg-config`` crate consults for system libraries.
+    # Windows registers no C compiler: Cargo links with MSVC there and the
+    # Nim FFI compiles with ``--cc:vcc``. The CLI check runs ``cargo build``
+    # itself, so it takes the same set plus its script's own tools.
+    # The ``ct-print`` edge's tools are its constructor's (``buildCtPrint``),
+    # not declared here.
+    for action in [recorderBuild, testsBuild.action, testsRun.action, cliVerify]:
+      appendRegisteredActionToolIdentityRefs(action.id,
+        ["cargo", "rustc", "nim", "nimble", "git", "capnp", "zstd"])
+      when defined(linux):
+        appendRegisteredActionToolIdentityRefs(action.id, ["gcc", "pkg-config"])
+      elif defined(macosx):
+        appendRegisteredActionToolIdentityRefs(action.id, ["clang", "pkg-config"])
+    appendRegisteredActionToolIdentityRefs(cliVerify.id, ["sh", "bash", "dirname", "grep"])
+    appendRegisteredActionToolIdentityRefs(cargoLockVerify.id,
+      ["sh", "bash", "dirname", "grep", "git", "cargo", "tar", "mktemp",
+        "mkdir", "cp", "ln", "basename", "rm", "cmp", "diff", "head", "cat"])
 
     discard collect("test", @[testsRun.action, cliVerify, cargoLockVerify])
