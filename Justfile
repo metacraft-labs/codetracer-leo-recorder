@@ -12,15 +12,26 @@ build-release:
 
 # The Cargo.lock check runs first: when the lock is stale it names the cause
 # and the remedy, where `cargo test --locked` would only refuse the lock.
-test:
-  bash tests/verify-cargo-lock-matches-trace-format.sh
+test: build-ct-print
+  CT_SIBLING_CARGO_LOCKS_STRICT=1 bash tests/verify-cargo-lock-matches-trace-format.sh
   cargo test --locked
   bash tests/verify-cli-convention-no-silent-skip.sh
 
 t: test
 
-test-rust:
+test-rust: build-ct-print
   cargo test --locked
+
+# Build `ct-print` in the sibling codetracer-trace-format-nim checkout. The
+# content tests read their recordings back with it at the fixed path
+# `../codetracer-trace-format-nim/ct-print`, and they fail when it is absent
+# rather than passing without checking the trace content. Nothing else builds
+# this binary, so without this recipe a fresh checkout cannot run them. The
+# sibling's `buildCtPrint` nimble task owns the compile flags and resolves that
+# package's Nim dependencies. The compile runs every time, and is the staleness
+# check.
+build-ct-print:
+  cd ../codetracer-trace-format-nim && nimble buildCtPrint
 
 verify-cli-convention:
   bash tests/verify-cli-convention-no-silent-skip.sh
@@ -28,7 +39,7 @@ verify-cli-convention:
 # The committed Cargo.lock must be exactly the lock of the trace-format tree
 # repro.lock pins and of the sibling checkout (see the script header).
 verify-cargo-lock:
-  bash tests/verify-cargo-lock-matches-trace-format.sh
+  CT_SIBLING_CARGO_LOCKS_STRICT=1 bash tests/verify-cargo-lock-matches-trace-format.sh
 
 lint:
   cargo fmt --check

@@ -8,8 +8,8 @@
 //! 2. **`ct print` content** — record a fixture and pipe the resulting
 //!    `.ct` container through `ct-print --json` from
 //!    `codetracer-trace-format-nim` to make content-level assertions.
-//!    Skips gracefully when `ct-print` is not present (i.e. when this
-//!    crate is built outside the metacraft workspace).
+//!    Fails when `ct-print` is not built: the decoder is a required
+//!    prerequisite, and `just test` builds it first (`just build-ct-print`).
 //! 3. **CLI env-var contract** — exercise the post-2026-05-08
 //!    `CODETRACER_LEO_RECORDER_OUT_DIR` /
 //!    `CODETRACER_LEO_RECORDER_DISABLED` env vars and the
@@ -227,15 +227,7 @@ fn test_traced_steps_reference_leo_lines() {
 /// `{"kind":"Int","i":42,"type_id":6}`.
 #[test]
 fn test_recorded_trace_via_ct_print_json() {
-    let ct_print = ct_print_path();
-    if !ct_print.exists() {
-        eprintln!(
-            "SKIP: ct-print not found at {} — only available within the \
-             metacraft workspace where codetracer-trace-format-nim is a sibling.",
-            ct_print.display()
-        );
-        return;
-    }
+    let ct_print = ct_print_required("test_recorded_trace_via_ct_print_json");
 
     let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
     let out_dir = tmp_dir.path().join("traces");
@@ -658,31 +650,30 @@ fn test_help_mentions_ct_print() {
 // assertion captures the spec-correct expectation so it surfaces the
 // moment the recorder catches up.
 
-/// Skip-helper: returns `Some(path)` to ct-print or logs a clear
-/// `SKIP:` diagnostic and returns `None`.  The
-/// `verify-cli-convention-no-silent-skip.sh` script greps for the
-/// literal `SKIP:` token, so silent skips remain forbidden.
-fn ct_print_or_skip(test_name: &str) -> Option<PathBuf> {
+/// Path to the `ct-print` binary that a content test requires.
+///
+/// Panics when the binary is absent. A test that returned early here would
+/// report success without reading a single trace, which is the silent pass this
+/// helper exists to rule out. `just test` builds the binary first (`just
+/// build-ct-print`), and `repro test` orders the tests after the same build.
+fn ct_print_required(test_name: &str) -> PathBuf {
     let p = ct_print_path();
-    if !p.exists() {
-        eprintln!(
-            "SKIP: {test_name} requires ct-print at {} -- only available \
-             within the metacraft workspace where codetracer-trace-format-nim \
-             is a sibling.",
-            p.display()
-        );
-        return None;
-    }
-    Some(p)
+    assert!(
+        p.exists(),
+        "{test_name} requires ct-print at {}, and it is not built. Run `just \
+         build-ct-print` (or `just test`), which builds it in the sibling \
+         codetracer-trace-format-nim checkout.",
+        p.display()
+    );
+    p
 }
 
 /// Record a program and return the `ct-print --full --strip-paths`
 /// JSON document plus the absolute path to the source file (so the
-/// caller can match `metadata.program`).  Returns `None` when
-/// `ct-print` is unavailable (the caller has already emitted a
-/// `SKIP:` line via `ct_print_or_skip`).
-fn record_and_dump_full(test_name: &str, program: &str) -> Option<(serde_json::Value, PathBuf)> {
-    let ct_print = ct_print_or_skip(test_name)?;
+/// caller can match `metadata.program`).  Panics when `ct-print` is
+/// unavailable (see `ct_print_required`).
+fn record_and_dump_full(test_name: &str, program: &str) -> (serde_json::Value, PathBuf) {
+    let ct_print = ct_print_required(test_name);
 
     let tmp_dir = tempfile::tempdir().expect("tempdir");
     let out_dir = tmp_dir.path().join("traces");
@@ -721,7 +712,7 @@ fn record_and_dump_full(test_name: &str, program: &str) -> Option<(serde_json::V
 
     drop(tmp_dir);
 
-    Some((doc, source_path))
+    (doc, source_path)
 }
 
 /// Decode every (varname, i64) pair from step events.  Rejects any
@@ -825,12 +816,10 @@ fn assert_metadata_program_ends_with(doc: &serde_json::Value, source_path: &Path
 /// post-loop value.
 #[test]
 fn test_control_flow_test_via_ct_print_full() {
-    let Some((doc, source_path)) = record_and_dump_full(
+    let (doc, source_path) = record_and_dump_full(
         "test_control_flow_test_via_ct_print_full",
         "control_flow_test.leo",
-    ) else {
-        return;
-    };
+    );
 
     assert_metadata_program_ends_with(&doc, &source_path);
 
@@ -915,12 +904,10 @@ fn test_control_flow_test_via_ct_print_full() {
 /// the default suite.
 #[test]
 fn test_control_flow_test_full_chain_decodes() {
-    let Some((doc, _)) = record_and_dump_full(
+    let (doc, _) = record_and_dump_full(
         "test_control_flow_test_full_chain_decodes",
         "control_flow_test.leo",
-    ) else {
-        return;
-    };
+    );
     let expected: Vec<(String, i64)> = vec![
         ("raw".into(), 7),
         ("sign".into(), 1),
@@ -941,12 +928,10 @@ fn test_control_flow_test_full_chain_decodes() {
 /// 2026-05-13) makes this test stable.
 #[test]
 fn test_nested_calls_test_via_ct_print_full() {
-    let Some((doc, source_path)) = record_and_dump_full(
+    let (doc, source_path) = record_and_dump_full(
         "test_nested_calls_test_via_ct_print_full",
         "nested_calls_test.leo",
-    ) else {
-        return;
-    };
+    );
 
     assert_metadata_program_ends_with(&doc, &source_path);
 
@@ -1004,12 +989,10 @@ fn test_nested_calls_test_via_ct_print_full() {
 /// structured evaluator (added 2026-05-13) handles all of them.
 #[test]
 fn test_collections_test_via_ct_print_full() {
-    let Some((doc, source_path)) = record_and_dump_full(
+    let (doc, source_path) = record_and_dump_full(
         "test_collections_test_via_ct_print_full",
         "collections_test.leo",
-    ) else {
-        return;
-    };
+    );
 
     assert_metadata_program_ends_with(&doc, &source_path);
 
@@ -1069,12 +1052,10 @@ fn test_collections_test_via_ct_print_full() {
 /// every declared function regardless of reachability.
 #[test]
 fn test_error_paths_test_via_ct_print_full() {
-    let Some((doc, source_path)) = record_and_dump_full(
+    let (doc, source_path) = record_and_dump_full(
         "test_error_paths_test_via_ct_print_full",
         "error_paths_test.leo",
-    ) else {
-        return;
-    };
+    );
 
     assert_metadata_program_ends_with(&doc, &source_path);
 
@@ -1141,12 +1122,10 @@ fn test_error_paths_test_via_ct_print_full() {
 /// then -- on a fixture where the failing path is reachable.
 #[test]
 fn test_error_paths_test_emits_assert_failure_event() {
-    let Some((doc, _)) = record_and_dump_full(
+    let (doc, _) = record_and_dump_full(
         "test_error_paths_test_emits_assert_failure_event",
         "error_paths_test.leo",
-    ) else {
-        return;
-    };
+    );
     let counts = &doc["counts"];
     assert_eq!(
         counts["io_events"].as_u64(),
@@ -1167,11 +1146,8 @@ fn test_error_paths_test_emits_assert_failure_event() {
 /// for the rationale and follow-up plan.
 #[test]
 fn test_assert_test_via_ct_print_full() {
-    let Some((doc, source_path)) =
-        record_and_dump_full("test_assert_test_via_ct_print_full", "assert_test.leo")
-    else {
-        return;
-    };
+    let (doc, source_path) =
+        record_and_dump_full("test_assert_test_via_ct_print_full", "assert_test.leo");
 
     assert_metadata_program_ends_with(&doc, &source_path);
 
@@ -1298,11 +1274,7 @@ fn test_assert_test_via_ct_print_full() {
 /// the static-sweep emit path in `tracer.rs`.
 #[test]
 fn test_assert_test_emits_assert_events() {
-    let Some((doc, _)) =
-        record_and_dump_full("test_assert_test_emits_assert_events", "assert_test.leo")
-    else {
-        return;
-    };
+    let (doc, _) = record_and_dump_full("test_assert_test_emits_assert_events", "assert_test.leo");
     let counts = &doc["counts"];
     assert_eq!(
         counts["io_events"].as_u64(),
@@ -1345,12 +1317,10 @@ fn test_assert_test_emits_assert_events() {
 /// let-binding in per-call source order.
 #[test]
 fn test_multi_function_test_via_ct_print_full() {
-    let Some((doc, source_path)) = record_and_dump_full(
+    let (doc, source_path) = record_and_dump_full(
         "test_multi_function_test_via_ct_print_full",
         "multi_function_test.leo",
-    ) else {
-        return;
-    };
+    );
 
     assert_metadata_program_ends_with(&doc, &source_path);
 
@@ -1494,12 +1464,10 @@ fn test_multi_function_test_via_ct_print_full() {
 /// in the trace today (real curve math lives in snarkVM).
 #[test]
 fn test_field_group_scalar_arith_test_via_ct_print_full() {
-    let Some((doc, source_path)) = record_and_dump_full(
+    let (doc, source_path) = record_and_dump_full(
         "test_field_group_scalar_arith_test_via_ct_print_full",
         "field_group_scalar_arith_test.leo",
-    ) else {
-        return;
-    };
+    );
 
     assert_metadata_program_ends_with(&doc, &source_path);
 
@@ -1585,12 +1553,10 @@ fn test_field_group_scalar_arith_test_via_ct_print_full() {
 /// `LeoKeccakHash`) and verbatim source-level call text.
 #[test]
 fn test_hash_builtins_test_via_ct_print_full() {
-    let Some((doc, source_path)) = record_and_dump_full(
+    let (doc, source_path) = record_and_dump_full(
         "test_hash_builtins_test_via_ct_print_full",
         "hash_builtins_test.leo",
-    ) else {
-        return;
-    };
+    );
 
     assert_metadata_program_ends_with(&doc, &source_path);
 
@@ -1691,12 +1657,10 @@ fn test_hash_builtins_test_via_ct_print_full() {
 /// `EventLogKind::Write`.
 #[test]
 fn test_mapping_finalize_test_via_ct_print_full() {
-    let Some((doc, source_path)) = record_and_dump_full(
+    let (doc, source_path) = record_and_dump_full(
         "test_mapping_finalize_test_via_ct_print_full",
         "mapping_finalize_test.leo",
-    ) else {
-        return;
-    };
+    );
 
     assert_metadata_program_ends_with(&doc, &source_path);
 
@@ -1808,12 +1772,10 @@ fn test_mapping_finalize_test_via_ct_print_full() {
 /// call's return value as a `ValueRecord::Struct`.
 #[test]
 fn test_record_token_test_via_ct_print_full() {
-    let Some((doc, source_path)) = record_and_dump_full(
+    let (doc, source_path) = record_and_dump_full(
         "test_record_token_test_via_ct_print_full",
         "record_token_test.leo",
-    ) else {
-        return;
-    };
+    );
 
     assert_metadata_program_ends_with(&doc, &source_path);
 
@@ -2004,12 +1966,10 @@ fn test_record_token_test_via_ct_print_full() {
 /// payload across the call boundary.
 #[test]
 fn test_context_builtins_test_via_ct_print_full() {
-    let Some((doc, source_path)) = record_and_dump_full(
+    let (doc, source_path) = record_and_dump_full(
         "test_context_builtins_test_via_ct_print_full",
         "context_builtins_test.leo",
-    ) else {
-        return;
-    };
+    );
 
     assert_metadata_program_ends_with(&doc, &source_path);
 
@@ -2182,12 +2142,10 @@ fn test_context_builtins_test_via_ct_print_full() {
 /// saturating clamps to `u32::MAX`.
 #[test]
 fn test_int_overflow_modes_test_via_ct_print_full() {
-    let Some((doc, source_path)) = record_and_dump_full(
+    let (doc, source_path) = record_and_dump_full(
         "test_int_overflow_modes_test_via_ct_print_full",
         "int_overflow_modes_test.leo",
-    ) else {
-        return;
-    };
+    );
 
     assert_metadata_program_ends_with(&doc, &source_path);
 
@@ -2305,11 +2263,8 @@ fn test_int_overflow_modes_test_via_ct_print_full() {
 /// step variable's value.
 #[test]
 fn test_cast_test_via_ct_print_full() {
-    let Some((doc, source_path)) =
-        record_and_dump_full("test_cast_test_via_ct_print_full", "cast_test.leo")
-    else {
-        return;
-    };
+    let (doc, source_path) =
+        record_and_dump_full("test_cast_test_via_ct_print_full", "cast_test.leo");
 
     assert_metadata_program_ends_with(&doc, &source_path);
 
@@ -2492,12 +2447,10 @@ fn test_cast_test_via_ct_print_full() {
 /// NOT evaluated and the call's `return_value` is `None`.
 #[test]
 fn test_async_finalize_failure_test_via_ct_print_full() {
-    let Some((doc, source_path)) = record_and_dump_full(
+    let (doc, source_path) = record_and_dump_full(
         "test_async_finalize_failure_test_via_ct_print_full",
         "async_finalize_failure_test.leo",
-    ) else {
-        return;
-    };
+    );
 
     assert_metadata_program_ends_with(&doc, &source_path);
 
@@ -2696,12 +2649,10 @@ fn test_async_finalize_failure_test_via_ct_print_full() {
 ///      file) rather than the caller's source file.
 #[test]
 fn test_program_imports_test_via_ct_print_full() {
-    let Some((doc, source_path)) = record_and_dump_full(
+    let (doc, source_path) = record_and_dump_full(
         "test_program_imports_test_via_ct_print_full",
         "program_imports_test.leo",
-    ) else {
-        return;
-    };
+    );
 
     assert_metadata_program_ends_with(&doc, &source_path);
 
@@ -2889,12 +2840,10 @@ fn test_program_imports_test_via_ct_print_full() {
 ///      (u64, post-cast).
 #[test]
 fn test_aleo_instructions_test_via_ct_print_full() {
-    let Some((doc, source_path)) = record_and_dump_full(
+    let (doc, source_path) = record_and_dump_full(
         "test_aleo_instructions_test_via_ct_print_full",
         "aleo_instructions_test.aleo",
-    ) else {
-        return;
-    };
+    );
 
     assert_metadata_program_ends_with(&doc, &source_path);
 
@@ -3071,12 +3020,10 @@ fn test_aleo_instructions_test_via_ct_print_full() {
 ///      the propagated `Bool(true)`.
 #[test]
 fn test_signature_verify_test_via_ct_print_full() {
-    let Some((doc, source_path)) = record_and_dump_full(
+    let (doc, source_path) = record_and_dump_full(
         "test_signature_verify_test_via_ct_print_full",
         "signature_verify_test.leo",
-    ) else {
-        return;
-    };
+    );
 
     assert_metadata_program_ends_with(&doc, &source_path);
 
@@ -3319,12 +3266,10 @@ fn test_signature_verify_test_via_ct_print_full() {
 ///      distinct type id; and `payment` returns 7 + 100 + 5 = 112.
 #[test]
 fn test_public_private_io_test_via_ct_print_full() {
-    let Some((doc, source_path)) = record_and_dump_full(
+    let (doc, source_path) = record_and_dump_full(
         "test_public_private_io_test_via_ct_print_full",
         "public_private_io_test.leo",
-    ) else {
-        return;
-    };
+    );
 
     assert_metadata_program_ends_with(&doc, &source_path);
 
@@ -3511,12 +3456,10 @@ fn test_public_private_io_test_via_ct_print_full() {
 ///   query(0)       -> view     = 0 + 1 = 1
 #[test]
 fn test_multi_test_entry_test_via_ct_print_full() {
-    let Some((doc, source_path)) = record_and_dump_full(
+    let (doc, source_path) = record_and_dump_full(
         "test_multi_test_entry_test_via_ct_print_full",
         "multi_test_entry_test.leo",
-    ) else {
-        return;
-    };
+    );
 
     assert_metadata_program_ends_with(&doc, &source_path);
 
@@ -3668,12 +3611,10 @@ fn test_multi_test_entry_test_via_ct_print_full() {
 /// trips as `ValueRecord::Bool` through ct-print --full.
 #[test]
 fn test_commitment_test_via_ct_print_full() {
-    let Some((doc, source_path)) = record_and_dump_full(
+    let (doc, source_path) = record_and_dump_full(
         "test_commitment_test_via_ct_print_full",
         "commitment_test.leo",
-    ) else {
-        return;
-    };
+    );
 
     assert_metadata_program_ends_with(&doc, &source_path);
 

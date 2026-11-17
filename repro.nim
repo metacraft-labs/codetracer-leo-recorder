@@ -76,6 +76,12 @@ import repro_project_dsl
 import repro_dsl_stdlib/foreign_env
 import repro_dsl_stdlib/packages/sh
 
+# The owning constructor of ``ct-print``. It lives in the sibling checkout this
+# repository's tests already resolve at the fixed path ``../codetracer-trace-format-nim``.
+import "../codetracer-trace-format-nim/build_writer_artifacts"
+
+const traceFormatNimRoot = "../codetracer-trace-format-nim"
+
 package codetracer_leo_recorder:
   defaultToolProvisioning "path"
 
@@ -88,8 +94,11 @@ package codetracer_leo_recorder:
     "cargo >=1.85"
     # C compiler driver — rustc links through `cc`, and build scripts
     # (cc-rs, the Nim FFI) compile C. Declaring it puts its directory on
-    # every cargo edge's PATH. Windows links with MSVC instead.
-    when defined(linux):
+    # every cargo edge's PATH. Windows Cargo links with MSVC instead; the
+    # owning ct-print constructor (``build_writer_artifacts.buildCtPrint``)
+    # separately compiles with GCC on Windows, so ``gcc`` is declared there
+    # for that edge only (the Windows cargo edges do not register it).
+    when defined(linux) or defined(windows):
       "gcc"
     elif defined(macosx):
       "clang"
@@ -108,6 +117,16 @@ package codetracer_leo_recorder:
     # static library into the cargo build (the FFI's C output
     # ``#include``s ``zstd.h`` and the CBOR+Zstd writer links libzstd).
     "zstd"
+    # zstd.h + libzstd for the sibling ct-print edge
+    # (``build_writer_artifacts.buildCtPrint`` compiles and links against
+    # them; ``zstd`` is the CLI only). The ct-print edge needs both on every
+    # host, so this is declared on Windows too: there reprobuild provisions
+    # ``zstd-dev`` from a tarball whose prefix holds ``zstd.h`` and a static
+    # ``libzstd.a``, which ct-print links with ``-lzstd``. The constructor
+    # cannot provision a tool from inside ``build:`` and refuses a recipe
+    # that omits any of ``CtPrintToolSelectors`` (the C compiler plus
+    # ``zstd-dev``), on Windows as on POSIX.
+    "zstd-dev"
 
     # pkg-config + OpenSSL — openssl-sys consults pkg-config to find
     # OpenSSL on Linux/macOS. The Windows build uses the rustls-tls
@@ -121,6 +140,36 @@ package codetracer_leo_recorder:
     # ``bash tests/verify-cargo-lock-matches-trace-format.sh`` steps
     # ``just test`` runs.
     "sh"
+    "bash"
+    "dirname"
+    "grep"
+    # ``nimble install --depsOnly`` in ``codetracer_trace_writer_nim``'s
+    # build.rs fetches the FFI's requirements with git, and the Cargo.lock
+    # check archives the pinned trace-format revision with it.
+    "git"
+    # The rest of what ``verify-cargo-lock-matches-trace-format.sh`` runs:
+    # it unpacks a ``git archive`` of the pinned trace-format revision
+    # (``tar``), builds a scratch shadow workspace (``mktemp``, ``mkdir``,
+    # ``cp``, ``ln``, ``basename``, ``rm``) and compares the re-resolved
+    # lock with the committed one (``cmp``, ``diff``, ``head``, ``cat``).
+    # Its edge's PATH is built from these declarations. The script runs on
+    # every platform, Windows included, so the list is deliberately
+    # unguarded and matches codetracer-cardano-recorder's. On Windows Repro
+    # resolves these from the Git for Windows (PortableGit / scoop) install;
+    # Repro builds older than reprobuild 22183a55f3 lack that resolution for
+    # ``mktemp``, ``cmp`` and ``diff`` and fail with "tool-resolution failed".
+    # That is a Repro defect fixed there, not a reason to drop them here.
+    "tar"
+    "mktemp"
+    "mkdir"
+    "cp"
+    "ln"
+    "basename"
+    "rm"
+    "cmp"
+    "diff"
+    "head"
+    "cat"
     # `choco pack` / `choco push` in .github/workflows/publish-chocolatey.yml.
     # Windows-guarded because Chocolatey is a Windows package manager with no
     # POSIX build, so an unguarded entry would fail to resolve on Linux/macOS.
@@ -198,14 +247,32 @@ package codetracer_leo_recorder:
       ],
       extraOutputs = @["target/debug/deps"])
 
+    # ---- ``ct-print`` prerequisite ------------------------------------
+    #
+    # The content tests read their recordings back with ``ct-print`` at the
+    # fixed sibling path and fail when it is absent. ``just test`` builds it
+    # first (``just build-ct-print``); here it is an edge, constructed by the
+    # sibling's own ``buildCtPrint`` so the compile flags stay in the
+    # repository that owns them. The test-run edge orders after it and names
+    # the binary as an input, so a missing or rebuilt ``ct-print`` re-runs the
+    # tests.
+    #
+    # It runs after the test build because that build's
+    # ``codetracer_trace_writer_nim`` ``build.rs`` is what installs the
+    # sibling's nimble ``requires`` (``results``, ``stew``) into the nimble
+    # path this compile resolves them from.
+    let ctPrintBuild = buildCtPrint(traceFormatNimRoot,
+                                    after = @[testsBuild.action])
+
     let testsRun = cargo.test(
       locked = true,
       actionId = "codetracer-leo-recorder.cargo-test-run",
-      after = @[testsBuild.action],
+      after = @[testsBuild.action, ctPrintBuild],
       extraInputs = @[
         "Cargo.toml", "Cargo.lock",
         "src", "tests", "test-programs",
-        "target/debug/deps"
+        "target/debug/deps",
+        ctPrintPath(traceFormatNimRoot)
       ])
 
     # ---- CLI-convention verification edge -----------------------------
@@ -249,19 +316,54 @@ package codetracer_leo_recorder:
     # of the trace-format revision ``repro.lock`` pins and against the
     # sibling checkout on disk, and requires both results to be
     # byte-identical to the committed lock (it never writes the
-    # committed lock). Like the CLI-convention script it is not a cargo
+    # committed lock). The edge runs it strict (``CT_SIBLING_CARGO_LOCKS_STRICT=1``),
+    # so a skipped check (missing sibling or registry cache) fails the
+    # edge instead of passing it; CI does not set that variable, and a
+    # non-strict skip would let an unverified lock through. Like the
+    # CLI-convention script it is not a cargo
     # target, so it is its own ``sh.shell`` execute edge. It needs no
     # built binary, so it has no ``after``. Non-cacheable: its verdict
     # depends on the sibling checkout and on the cargo registry index
     # cache, both outside this repo, so it is re-run every ``repro
     # test`` pass (matching ``just test``).
     let cargoLockVerify = shell(
-      command = "bash tests/verify-cargo-lock-matches-trace-format.sh",
+      command = "CT_SIBLING_CARGO_LOCKS_STRICT=1 bash tests/verify-cargo-lock-matches-trace-format.sh",
       actionId = "codetracer-leo-recorder.verify-cargo-lock",
       extraInputs = @[
         "tests/verify-cargo-lock-matches-trace-format.sh",
         "Cargo.toml", "Cargo.lock", "repro.lock"
       ],
       cacheable = false)
+
+    # ---- Tool identities each edge runs --------------------------------
+    #
+    # A ``uses:`` declaration alone does not reach an edge: under typed
+    # provisioning an action's PATH (and pkg-config search path) is built
+    # from the tool identities registered on it. Without these the cargo
+    # edges ran with no ``nim`` / ``nimble`` on PATH, and
+    # ``codetracer_trace_writer_nim``'s build.rs failed at ``nimble install
+    # --depsOnly``; on macOS they also ran without the Nix clang wrapper, so
+    # linking zstd-sys's build script failed on ``-liconv``. Every cargo edge
+    # builds that crate, so each gets what its build scripts run: ``nimble``
+    # (which fetches with ``git``) and ``nim`` for the Nim FFI, ``capnp`` for
+    # ``codetracer_trace_format_capnp``, the C compiler for cc-rs builds
+    # (zstd-sys, ring, ...) and rustc's link step, and ``pkg-config``, which
+    # the ``pkg-config`` crate consults for system libraries.
+    # Windows registers no C compiler: Cargo links with MSVC there and the
+    # Nim FFI compiles with ``--cc:vcc``. The CLI check runs ``cargo build``
+    # itself, so it takes the same set plus its script's own tools.
+    # The ``ct-print`` edge's tools are its constructor's (``buildCtPrint``),
+    # not declared here.
+    for action in [recorderBuild, testsBuild.action, testsRun.action, cliVerify]:
+      appendRegisteredActionToolIdentityRefs(action.id,
+        ["cargo", "rustc", "nim", "nimble", "git", "capnp", "zstd"])
+      when defined(linux):
+        appendRegisteredActionToolIdentityRefs(action.id, ["gcc", "pkg-config"])
+      elif defined(macosx):
+        appendRegisteredActionToolIdentityRefs(action.id, ["clang", "pkg-config"])
+    appendRegisteredActionToolIdentityRefs(cliVerify.id, ["sh", "bash", "dirname", "grep"])
+    appendRegisteredActionToolIdentityRefs(cargoLockVerify.id,
+      ["sh", "bash", "dirname", "grep", "git", "cargo", "tar", "mktemp",
+        "mkdir", "cp", "ln", "basename", "rm", "cmp", "diff", "head", "cat"])
 
     discard collect("test", @[testsRun.action, cliVerify, cargoLockVerify])
