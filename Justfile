@@ -19,6 +19,7 @@ test: build-ct-print
 
 t: test
 
+# ci-test-audit: covered-by test (`test` runs `cargo test --locked` too)
 test-rust: build-ct-print
   cargo test --locked
 
@@ -33,18 +34,26 @@ test-rust: build-ct-print
 build-ct-print:
   cd ../codetracer-trace-format-nim && nimble buildCtPrint
 
+# ci-test-audit: covered-by test and lint (both run this script)
 verify-cli-convention:
   bash tests/verify-cli-convention-no-silent-skip.sh
 
 # The committed Cargo.lock must be exactly the lock of the trace-format tree
 # repro.lock pins and of the sibling checkout (see the script header).
+# ci-test-audit: covered-by test (its first line is this command)
 verify-cargo-lock:
   CT_SIBLING_CARGO_LOCKS_STRICT=1 bash tests/verify-cargo-lock-matches-trace-format.sh
 
+# The packaging checks are static checks of the files under packaging/, so
+# they run here, on every CI leg: the channels verified in source form, and
+# the test that keeps `verify-package` from reporting OK for a check it did
+# not run. (`test` stays the set `repro test` mirrors in repro.nim.)
 lint:
   cargo fmt --check
   cargo clippy --locked --all-targets -- -D warnings
   bash tests/verify-cli-convention-no-silent-skip.sh
+  bash tests/verify-package-no-vacuous-pass.sh
+  just verify-packaging-sources
 
 format:
   cargo fmt
@@ -69,10 +78,10 @@ prepare-ci:
   )
 
 # --- M13: Packaging UX Standardization ---
-# These recipes implement Repo-Requirements.md §2.5. The OS-packaged
-# recorders share a uniform packaging surface: `bump-version` rewrites
-# Cargo.toml + packaging/recorder-metadata.yml; `build-package` shells
-# out to packaging/build-all.sh with the requested channel selector;
+# The OS-packaged CodeTracer recorders share a uniform packaging
+# surface: `bump-version` rewrites Cargo.toml +
+# packaging/recorder-metadata.yml; `build-package` shells out to
+# packaging/build-all.sh with the requested channel selector;
 # `verify-package` introspects the produced artifact.
 #
 # The shebang recipes below let Just hand the recipe body to the
@@ -131,66 +140,91 @@ build-package channel:
     CT_PACKAGING_CHANNELS={{channel}} bash packaging/build-all.sh
 
 # Verify the artifact produced by `build-package <channel>`.
-# Set CT_VERIFY_STRICT=1 to fail when a verification tool is missing
-# (default: SKIP with a warning so laptop runs don't break).
-verify-package channel:
+#
+# Strict by default: a verification tool that is not on PATH, or a
+# missing .deb / .rpm for those two channels, FAILS the check. A check
+# that did not run must never report OK.
+# On a laptop without e.g. dpkg-deb, `CT_VERIFY_STRICT=0` turns each
+# such failure into a `SKIP:` line and exit 0, and still prints no OK.
+#
+# `dist` is the directory holding the built .deb / .rpm. It defaults to
+# packaging/dist/<channel>, where `build-package` writes them; the
+# publish-deb / publish-rpm workflows pass the directory they build into.
+verify-package channel dist="":
     #!/usr/bin/env python3
     import json, os, re, shutil, subprocess, sys
     from pathlib import Path
     ch = "{{channel}}"
+    dist = "{{dist}}"
     root = Path(".").resolve()
     pkg = root / "packaging"
-    strict = os.environ.get("CT_VERIFY_STRICT") == "1"
+    strict = os.environ.get("CT_VERIFY_STRICT", "1") != "0"
 
-    def skip(tool):
-        if shutil.which(tool):
-            return False
+    def unverified(why):
+        # Every check that cannot run ends here, so none can fall through
+        # to an OK line.
         if strict:
-            print(f"::error::tool {tool} required in strict mode")
+            print(f"::error::verify-package {ch}: {why} (CT_VERIFY_STRICT=0 skips it)")
             sys.exit(1)
-        print(f"[verify] SKIP: {tool} not on PATH")
-        return True
+        print(f"[verify] SKIP: {ch} not verified: {why} (CT_VERIFY_STRICT=0)")
+        sys.exit(0)
+
+    def need(tool):
+        if not shutil.which(tool):
+            unverified(f"{tool} is not on PATH")
+
+    def built(suffix):
+        d = Path(dist) if dist else pkg / "dist" / ch
+        found = sorted(d.rglob(f"*.{suffix}")) if d.is_dir() else []
+        if not found:
+            unverified(f"no .{suffix} in {d} (run `just build-package {ch}` first)")
+        return found
 
     if ch == "homebrew":
         formula = next(pkg.glob("homebrew/*.rb"), None)
         if formula is None:
             print("::error::no homebrew formula"); sys.exit(1)
-        if not skip("ruby"):
-            subprocess.run(["ruby", "-c", str(formula)], check=True, capture_output=True)
+        need("ruby")
+        subprocess.run(["ruby", "-c", str(formula)], check=True, capture_output=True)
         print(f"[verify] homebrew {formula.name} OK")
     elif ch == "nix":
         drv = pkg / "nix" / "default.nix"
         if not drv.exists():
             print("::error::no nix derivation"); sys.exit(1)
-        if not skip("nix-instantiate"):
-            subprocess.run(["nix-instantiate", "--eval", "-E", f"builtins.pathExists {drv}"], check=True, capture_output=True)
+        need("nix-instantiate")
+        # --parse checks the expression without evaluating it, so the
+        # check needs no NIX_PATH and fetches nothing. Evaluating it would
+        # need <nixpkgs>, so pname and version are matched as strings
+        # against packaging/recorder-metadata.yml instead.
+        subprocess.run(["nix-instantiate", "--parse", str(drv)], check=True, stdout=subprocess.DEVNULL)
+        meta = (pkg / "recorder-metadata.yml").read_text()
+        text = drv.read_text()
+        for field, pattern in (("name", 'pname = "{}";'), ("version", 'version ? "{}"')):
+            m = re.search(rf"^\s*{field}:\s*(\S+)", meta, re.MULTILINE)
+            if m is None:
+                print(f"::error::recorder-metadata.yml has no {field}"); sys.exit(1)
+            if pattern.format(m.group(1)) not in text:
+                print(f"::error::{drv.name} lacks {pattern.format(m.group(1))}"); sys.exit(1)
         print(f"[verify] nix {drv.name} OK")
     elif ch == "aur":
         pkgbuild = pkg / "aur" / "PKGBUILD"
         if not pkgbuild.exists():
             print("::error::no PKGBUILD"); sys.exit(1)
+        need("bash")
         subprocess.run(["bash", "-n", str(pkgbuild)], check=True)
         print(f"[verify] aur {pkgbuild.name} OK")
     elif ch == "deb":
-        deb_dir = pkg / "dist" / "deb"
-        debs = list(deb_dir.glob("*.deb")) if deb_dir.exists() else []
-        if not debs:
-            print("[verify] no deb yet — run `just build-package deb` first")
-            sys.exit(1 if strict else 0)
-        if not skip("dpkg-deb"):
-            for d in debs:
-                subprocess.run(["dpkg-deb", "-I", str(d)], check=True, capture_output=True)
-                print(f"[verify] deb {d.name} OK")
+        need("dpkg-deb")
+        for d in built("deb"):
+            subprocess.run(["dpkg-deb", "-I", str(d)], check=True, capture_output=True)
+            subprocess.run(["dpkg-deb", "-c", str(d)], check=True, capture_output=True)
+            print(f"[verify] deb {d.name} OK")
     elif ch == "rpm":
-        rpm_dir = pkg / "dist" / "rpm"
-        rpms = list(rpm_dir.glob("*.rpm")) if rpm_dir.exists() else []
-        if not rpms:
-            print("[verify] no rpm yet — run `just build-package rpm` first")
-            sys.exit(1 if strict else 0)
-        if not skip("rpm"):
-            for r in rpms:
-                subprocess.run(["rpm", "-qpi", str(r)], check=True, capture_output=True)
-                print(f"[verify] rpm {r.name} OK")
+        need("rpm")
+        for r in built("rpm"):
+            subprocess.run(["rpm", "-qpi", str(r)], check=True, capture_output=True)
+            subprocess.run(["rpm", "-qpl", str(r)], check=True, capture_output=True)
+            print(f"[verify] rpm {r.name} OK")
     elif ch == "scoop":
         sf = next(pkg.glob("scoop/*.json"), None)
         if sf is None:
@@ -249,14 +283,20 @@ verify-nix:
 verify-aur:
     just verify-package aur
 
-verify-deb:
-    just verify-package deb
+verify-deb dist="":
+    just verify-package deb "{{dist}}"
 
-verify-rpm:
-    just verify-package rpm
+verify-rpm dist="":
+    just verify-package rpm "{{dist}}"
 
 verify-scoop:
     just verify-package scoop
 
 verify-chocolatey:
     just verify-package chocolatey
+
+# The channels whose packaging is checked in source form, with nothing to
+# build first. A recorder's `lint` (or `test`) recipe runs this, so every
+# CI leg checks them; deb and rpm are verified by publish-deb / publish-rpm on
+# the package they have just built, dry runs included.
+verify-packaging-sources: verify-homebrew verify-nix verify-aur verify-scoop verify-chocolatey

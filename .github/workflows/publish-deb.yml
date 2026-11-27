@@ -149,6 +149,15 @@ jobs:
           nix shell --inputs-from . nixpkgs#dpkg -c \
             dpkg-deb --info "out/codetracer-leo-recorder_${VERSION}_${ARCH}.deb"
 
+      - name: Verify .deb
+        # `just verify-deb` on the package just built, before it is signed or
+        # uploaded. The step has no `if:`, so a dry run verifies too and a
+        # broken package fails here instead of after publication.
+        run: |
+          set -euo pipefail
+          nix shell --inputs-from . nixpkgs#dpkg nixpkgs#just nixpkgs#python3 -c \
+            just verify-deb out
+
       - name: Sign .deb
         if: ${{ inputs.dry_run == false }}
         env:
